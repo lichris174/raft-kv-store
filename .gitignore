@@ -1,0 +1,9 @@
+/bin/
+/data/
+/datademo/
+/databench/
+data*/
+/crashlogs/
+/stream*.txt
+*.exe
+benchmark/report.txt

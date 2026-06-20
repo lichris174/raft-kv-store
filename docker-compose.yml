@@ -1,0 +1,46 @@
+# 5-node raft-kv-store cluster + dashboard.
+#
+#   docker compose up --build
+#   open http://localhost:8080   (dashboard)
+#
+# Each node: gRPC on 90NN (internal), HTTP/JSON gateway on 80NN (published).
+# HTTP port = gRPC port - 1000 (the convention the dashboard uses to follow
+# leader hints). read-mode=follower so every node serves local reads.
+services:
+  node1:
+    build: .
+    command: ["--id","n1","--addr",":9001","--advertise","node1:9001","--peers","node2:9002,node3:9003,node4:9004,node5:9005","--http",":8001","--read-mode","follower","--data-dir","/data","--snapshot-threshold","2000"]
+    ports: ["8001:8001"]
+    volumes: ["n1:/data"]
+  node2:
+    build: .
+    command: ["--id","n2","--addr",":9002","--advertise","node2:9002","--peers","node1:9001,node3:9003,node4:9004,node5:9005","--http",":8002","--read-mode","follower","--data-dir","/data","--snapshot-threshold","2000"]
+    ports: ["8002:8002"]
+    volumes: ["n2:/data"]
+  node3:
+    build: .
+    command: ["--id","n3","--addr",":9003","--advertise","node3:9003","--peers","node1:9001,node2:9002,node4:9004,node5:9005","--http",":8003","--read-mode","follower","--data-dir","/data","--snapshot-threshold","2000"]
+    ports: ["8003:8003"]
+    volumes: ["n3:/data"]
+  node4:
+    build: .
+    command: ["--id","n4","--addr",":9004","--advertise","node4:9004","--peers","node1:9001,node2:9002,node3:9003,node5:9005","--http",":8004","--read-mode","follower","--data-dir","/data","--snapshot-threshold","2000"]
+    ports: ["8004:8004"]
+    volumes: ["n4:/data"]
+  node5:
+    build: .
+    command: ["--id","n5","--addr",":9005","--advertise","node5:9005","--peers","node1:9001,node2:9002,node3:9003,node4:9004","--http",":8005","--read-mode","follower","--data-dir","/data","--snapshot-threshold","2000"]
+    ports: ["8005:8005"]
+    volumes: ["n5:/data"]
+  dashboard:
+    image: nginx:alpine
+    volumes: ["./dashboard:/usr/share/nginx/html:ro"]
+    ports: ["8080:80"]
+    depends_on: [node1, node2, node3, node4, node5]
+
+volumes:
+  n1: {}
+  n2: {}
+  n3: {}
+  n4: {}
+  n5: {}

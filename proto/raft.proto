@@ -1,0 +1,97 @@
+syntax = "proto3";
+package raft;
+option go_package = "github.com/chrisli/raft-kv-store/proto;raftpb";
+
+// Client-facing key-value API. Feature 1 implements this against a single node
+// with an in-memory store (no Raft yet). Internal node-to-node RPCs
+// (RequestVote, AppendEntries, InstallSnapshot) are added in later features.
+service KV {
+  rpc Get(GetRequest) returns (GetReply);
+  rpc Set(SetRequest) returns (WriteReply);
+  rpc Delete(DeleteRequest) returns (WriteReply);
+  rpc Status(StatusRequest) returns (StatusReply);
+}
+
+message GetRequest { string key = 1; }
+message GetReply {
+  string value = 1;
+  bool found = 2;
+  string leader_hint = 3; // set when a non-leader cannot serve (later features)
+}
+
+message SetRequest {
+  string key = 1;
+  string value = 2;
+}
+
+message DeleteRequest { string key = 1; }
+
+message WriteReply {
+  bool ok = 1;
+  string leader_hint = 2; // address of current leader if this node is not leader
+  string error = 3;
+}
+
+// Internal node-to-node consensus RPCs.
+service Raft {
+  rpc RequestVote(RequestVoteArgs) returns (RequestVoteReply);
+  rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesReply);
+  rpc InstallSnapshot(InstallSnapshotArgs) returns (InstallSnapshotReply);
+}
+
+message InstallSnapshotArgs {
+  uint64 term = 1;
+  string leader_id = 2;
+  uint64 last_included_index = 3;
+  uint64 last_included_term = 4;
+  bytes data = 5; // serialized state machine snapshot
+}
+message InstallSnapshotReply {
+  uint64 term = 1;
+}
+
+message LogEntry {
+  uint64 term = 1;
+  uint64 index = 2;
+  string op = 3; // "set" | "del"
+  string key = 4;
+  string value = 5;
+}
+
+message RequestVoteArgs {
+  uint64 term = 1;
+  string candidate_id = 2; // candidate's advertised (dialable) address
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+message RequestVoteReply {
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+
+message AppendEntriesArgs {
+  uint64 term = 1;
+  string leader_id = 2; // leader's advertised (dialable) address
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated LogEntry entries = 5; // empty for heartbeat (Feature 2)
+  uint64 leader_commit = 6;
+}
+message AppendEntriesReply {
+  uint64 term = 1;
+  bool success = 2;
+}
+
+message StatusRequest {}
+message StatusReply {
+  string node_id = 1;
+  string role = 2;          // leader | follower | candidate
+  uint64 term = 3;
+  uint64 commit_index = 4;
+  uint64 last_applied = 5;
+  string leader_id = 6;
+  repeated string peers = 7;
+  int32 num_keys = 8;
+  uint64 snapshot_index = 9;
+  int32 log_len = 10;
+}

@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Raft Benchmark and Chaos Control</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:#111110; --bg-2:#1A1A19; --bg-3:#222220; --bg-4:#2A2A28;
+    --dim:#363633; --muted:#5E5E58; --sub:#888880; --text:#D4D4CC; --bright:#EEEEE6;
+    --rule:#222220; --amber:#E8890C; --amber-2:#F2A93B; --amber-bg:#1C1608;
+    --green:#4A9E5C; --green-bg:#0A180C; --red:#C85050; --red-bg:#1A0A0A;
+    --blue:#4A80C8; --blue-bg:#080E1A;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+    --mono:ui-monospace,"Cascadia Code","Menlo","Consolas",monospace;
+  }
+  html,body { background:var(--bg); color:var(--text); font-family:var(--sans); font-size:13px; line-height:1.5; min-height:100vh; }
+  .console { max-width:1200px; margin:0 auto; padding:0 24px 56px; }
+
+  .masthead { border-bottom:1px solid var(--rule); padding:22px 0 14px; display:flex; align-items:baseline; gap:20px; flex-wrap:wrap; }
+  .masthead-eyebrow { font-size:10px; font-weight:500; letter-spacing:0.14em; text-transform:uppercase; color:var(--muted); margin-bottom:3px; }
+  .masthead-wordmark { font-size:19px; font-weight:600; letter-spacing:-0.025em; color:var(--bright); }
+  .masthead-right { margin-left:auto; display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  .run-badge { font-size:11px; font-weight:500; padding:3px 10px; letter-spacing:0.02em; white-space:nowrap; border:1px solid var(--dim); color:var(--muted); }
+  .run-badge.live { color:var(--amber); background:var(--amber-bg); border-color:#36280A; }
+
+  .section-label { font-size:9.5px; font-weight:600; letter-spacing:0.16em; text-transform:uppercase; color:var(--muted); padding:20px 0 10px; display:flex; align-items:center; gap:12px; }
+  .section-label::after { content:""; flex:1; height:1px; background:var(--rule); }
+
+  .panels { display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--rule); border:1px solid var(--rule); }
+  @media (max-width:760px){ .panels { grid-template-columns:1fr; } }
+  .panel { background:var(--bg); padding:16px 18px; }
+  .panel-title { font-size:9.5px; font-weight:600; letter-spacing:0.14em; text-transform:uppercase; color:var(--muted); margin-bottom:14px; display:flex; align-items:center; gap:8px; }
+  .panel-title .dot { width:6px; height:6px; border-radius:50%; background:var(--amber); }
+  .panel-title.chaos .dot { background:var(--red); }
+  .panel-sub { font-size:10.5px; color:var(--muted); margin:-8px 0 14px; line-height:1.45; }
+
+  .field-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px 12px; margin-bottom:14px; }
+  .field { display:flex; flex-direction:column; gap:4px; }
+  .field.full { grid-column:1 / -1; }
+  .field label { font-size:8.5px; font-weight:600; letter-spacing:0.1em; text-transform:uppercase; color:var(--muted); }
+  .field input { font-family:var(--mono); font-size:12px; background:var(--bg-2); border:1px solid var(--dim); color:var(--text); padding:6px 9px; outline:none; width:100%; }
+  .field input:focus { border-color:var(--amber); }
+  .panel.chaos .field input:focus { border-color:var(--red); }
+  .hint { font-size:9.5px; color:var(--muted); font-family:var(--mono); }
+
+  .btn { font-family:var(--sans); font-size:11px; font-weight:600; letter-spacing:0.04em; background:var(--bg-3); color:var(--text); border:1px solid var(--dim); padding:7px 16px; cursor:pointer; text-transform:uppercase; }
+  .btn:hover { background:var(--bg-4); border-color:var(--sub); }
+  .btn:disabled { opacity:0.4; cursor:not-allowed; }
+  .btn-primary { background:var(--amber); color:#0C0700; border-color:var(--amber); font-weight:700; }
+  .btn-primary:hover { background:var(--amber-2); border-color:var(--amber-2); color:#0C0700; }
+  .btn-danger { background:var(--red); color:#150404; border-color:var(--red); font-weight:700; }
+  .btn-danger:hover { background:#D86060; border-color:#D86060; }
+  .btn-row { display:flex; gap:8px; align-items:center; }
+
+  /* live node strip */
+  .nodes-strip { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:1px; background:var(--rule); border:1px solid var(--rule); }
+  .nodecell { background:var(--bg); padding:9px 11px; border-top:2px solid transparent; }
+  .nodecell.role-leader { background:var(--amber-bg); border-top-color:var(--amber); }
+  .nodecell.role-follower { border-top-color:var(--dim); }
+  .nodecell.role-candidate { background:var(--blue-bg); border-top-color:var(--blue); }
+  .nodecell.role-down { background:var(--bg-2); border-top-color:var(--red); opacity:0.6; }
+  .nc-role { font-size:8px; font-weight:700; letter-spacing:0.16em; text-transform:uppercase; color:var(--muted); }
+  .role-leader .nc-role { color:var(--amber); } .role-candidate .nc-role { color:var(--blue); } .role-down .nc-role { color:var(--red); }
+  .nc-id { font-family:var(--mono); font-size:13px; font-weight:700; color:var(--bright); margin:1px 0 6px; }
+  .role-down .nc-id { color:var(--muted); text-decoration:line-through; }
+  .nc-stats { font-family:var(--mono); font-size:9.5px; color:var(--muted); line-height:1.6; }
+
+  /* result metrics */
+  .metrics { display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:1px; background:var(--rule); border:1px solid var(--rule); margin-bottom:12px; }
+  .metric { background:var(--bg); padding:11px 13px; }
+  .metric-key { font-size:8px; font-weight:600; letter-spacing:0.1em; text-transform:uppercase; color:var(--muted); margin-bottom:3px; }
+  .metric-val { font-family:var(--mono); font-size:17px; font-weight:700; color:var(--bright); }
+  .metric-val.amber { color:var(--amber-2); } .metric-val.green { color:var(--green); } .metric-val.red { color:var(--red); }
+  .metric-unit { font-size:9px; color:var(--muted); font-weight:400; }
+
+  .chaos-rounds { display:flex; flex-wrap:wrap; gap:5px; margin-bottom:12px; }
+  .round-pip { font-family:var(--mono); font-size:10px; padding:3px 8px; border:1px solid var(--dim); color:var(--muted); }
+  .round-pip.ok { color:var(--green); border-color:#1A3320; background:var(--green-bg); }
+  .round-pip.bad { color:var(--red); border-color:#3A1414; background:var(--red-bg); }
+
+  .verdict { font-size:12px; font-weight:600; padding:8px 12px; margin-bottom:12px; border-left:3px solid var(--dim); color:var(--muted); font-family:var(--mono); }
+  .verdict.pass { color:var(--green); border-color:var(--green); background:var(--green-bg); }
+  .verdict.fail { color:var(--red); border-color:var(--red); background:var(--red-bg); }
+
+  .console-out { background:#0C0C0B; border:1px solid var(--rule); height:300px; overflow-y:auto; padding:10px 12px; font-family:var(--mono); font-size:11px; line-height:1.55; }
+  .cl { white-space:pre-wrap; word-break:break-word; color:var(--sub); }
+  .cl.meta { color:var(--muted); } .cl.ok { color:var(--green); } .cl.warn { color:var(--amber-2); } .cl.err { color:var(--red); } .cl.head { color:var(--bright); font-weight:600; }
+</style>
+</head>
+<body>
+<div class="console">
+
+  <header class="masthead">
+    <div>
+      <div class="masthead-eyebrow">Raft Distributed KV Store</div>
+      <div class="masthead-wordmark">Benchmark &amp; Chaos Control</div>
+    </div>
+    <div class="masthead-right">
+      <span class="run-badge" id="run-badge">idle</span>
+    </div>
+  </header>
+
+  <div class="section-label">Harnesses</div>
+  <div class="panels">
+    <!-- BENCHMARK -->
+    <div class="panel">
+      <div class="panel-title"><span class="dot"></span>Benchmark</div>
+      <div class="panel-sub">Launches a 5-node cluster (follower reads) and drives concurrent load. Reports throughput + latency percentiles.</div>
+      <div class="field-grid">
+        <div class="field"><label>Writers</label><input id="b-writers" value="24" inputmode="numeric"></div>
+        <div class="field"><label>Readers</label><input id="b-readers" value="16" inputmode="numeric"></div>
+        <div class="field"><label>Duration</label><input id="b-duration" value="5s"></div>
+        <div class="field"><label>Snapshot threshold</label><input id="b-threshold" value="2000" inputmode="numeric"></div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="b-run">Run benchmark</button>
+        <span class="hint" id="b-hint"></span>
+      </div>
+    </div>
+
+    <!-- CHAOS -->
+    <div class="panel chaos">
+      <div class="panel-title chaos"><span class="dot"></span>Chaos</div>
+      <div class="panel-sub">Kills &amp; restarts random nodes each round, verifying committed data survives. Low threshold = aggressive compaction.</div>
+      <div class="field-grid">
+        <div class="field"><label>Rounds</label><input id="c-rounds" value="8" inputmode="numeric"></div>
+        <div class="field"><label>Snapshot threshold</label><input id="c-threshold" value="25" inputmode="numeric"></div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-danger" id="c-run">Run chaos</button>
+        <button class="btn" id="stop-btn" disabled>Stop</button>
+        <span class="hint" id="c-hint"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-label">Live cluster</div>
+  <div class="nodes-strip" id="nodes-strip"></div>
+
+  <div class="section-label">Results</div>
+  <div id="results"><div class="verdict">No run yet. Start a benchmark or chaos run above.</div></div>
+
+  <div class="section-label">Output</div>
+  <div class="console-out" id="console-out"></div>
+
+</div>
+<script>
+const NODE_HTTP = [8001,8002,8003,8004,8005].map(p => "http://localhost:"+p);
+const $ = id => document.getElementById(id);
+
+let running = false;
+let curKind = null;
+let benchAcc = {};      // accumulates parsed WRITE/READ blocks
+let chaosRounds = [];   // [{n, ok}]
+
+// ---------- SSE ----------
+function connectStream() {
+  const es = new EventSource("/stream");
+  es.onmessage = ev => {
+    let e; try { e = JSON.parse(ev.data); } catch { return; }
+    if (e.t === "start") onStart(e);
+    else if (e.t === "line") onLine(e.s);
+    else if (e.t === "end") onEnd(e.code);
+  };
+  es.onerror = () => { /* browser auto-reconnects */ };
+}
+
+function onStart(e) {
+  running = true; curKind = e.kind;
+  benchAcc = {}; chaosRounds = [];
+  setBadge(e.kind === "chaos" ? "chaos running" : "benchmark running", true);
+  setButtons();
+  if (e.kind === "bench") $("results").innerHTML = '<div class="verdict">Benchmark running…</div>';
+  else $("results").innerHTML = '<div class="verdict">Chaos running…</div><div class="chaos-rounds" id="round-strip"></div>';
+  clearConsole();
+  logLine("head", "> " + e.cmd);
+}
+
+function onEnd(code) {
+  running = false;
+  setBadge("idle", false);
+  setButtons();
+  logLine(code === 0 ? "ok" : "err", "finished (exit " + code + ")");
+  if (curKind === "chaos") finalizeChaos(code);
+  curKind = null;
+}
+
+// ---------- output parsing ----------
+function onLine(s) {
+  const cls = classify(s);
+  logLine(cls, s);
+  if (curKind === "bench") parseBench(s);
+  else if (curKind === "chaos") parseChaos(s);
+}
+
+function classify(s) {
+  const t = s.toLowerCase();
+  if (/panic|fail|mismatch|denied|error=/.test(t) && !/errors=1[0-9]\b/.test(t)) {
+    if (/passed|integrity ok/.test(t)) return "ok";
+    return "err";
+  }
+  if (/warn/.test(t)) return "warn";
+  if (/passed|integrity ok|recovered|elected|leader=/.test(t)) return "ok";
+  if (/^=+$|^\s*write|^\s*read|launching|all .* up/.test(t)) return "head";
+  return "";
+}
+
+// bench lines look like:
+//   WRITE   ops=55490     11094 ops/s  errors=24
+//           latency  p50=1.61ms  p95=4.24ms  p99=17.97ms  max=50.45ms
+let lastPhase = null;
+function parseBench(s) {
+  const m = s.match(/^(WRITE|READ)\s+ops=(\d+)\s+([\d.]+)\s+ops\/s\s+errors=(\d+)/);
+  if (m) {
+    lastPhase = m[1];
+    benchAcc[m[1]] = Object.assign(benchAcc[m[1]]||{}, {
+      ops:+m[2], tput:+m[3], errors:+m[4]
+    });
+    renderBench();
+    return;
+  }
+  const l = s.match(/latency\s+p50=(\S+)\s+p95=(\S+)\s+p99=(\S+)\s+max=(\S+)/);
+  if (l && lastPhase) {
+    benchAcc[lastPhase] = Object.assign(benchAcc[lastPhase]||{}, {
+      p50:l[1], p95:l[2], p99:l[3], max:l[4]
+    });
+    renderBench();
+  }
+}
+
+function renderBench() {
+  const blocks = ["WRITE","READ"].filter(k => benchAcc[k]).map(k => {
+    const d = benchAcc[k];
+    const errRate = d.ops ? (d.errors/(d.ops+d.errors)*100) : 0;
+    const errCls = errRate > 1 ? "red" : "green";
+    return `<div class="panel-title" style="padding:0;margin:14px 0 8px;">${k}</div>
+      <div class="metrics">
+        ${metric("throughput", fmt(d.tput), "ops/s", "amber")}
+        ${metric("ops", fmt(d.ops), "", "")}
+        ${metric("errors", d.errors!=null?fmt(d.errors):"-", errRate?("("+errRate.toFixed(2)+"%)"):"", errCls)}
+        ${metric("p50", d.p50||"-", "", "")}
+        ${metric("p99", d.p99||"-", "", "")}
+        ${metric("max", d.max||"-", "", "")}
+      </div>`;
+  }).join("");
+  $("results").innerHTML = blocks || '<div class="verdict">Benchmark running…</div>';
+}
+
+function metric(k,v,unit,cls){
+  return `<div class="metric"><div class="metric-key">${k}</div><div class="metric-val ${cls||''}">${v} <span class="metric-unit">${unit||''}</span></div></div>`;
+}
+function fmt(n){ return Number(n).toLocaleString(); }
+
+// chaos lines:
+//   -- round 3/8 : killing :9002 (n2) --
+//   integrity OK (...)   |   MISMATCH ...   |   FAIL: cluster lost quorum
+let chaosCur = null;
+function parseChaos(s) {
+  const r = s.match(/round\s+(\d+)\/(\d+)/i);
+  if (r) { chaosCur = {n:+r[1], total:+r[2], ok:null}; return; }
+  if (/integrity ok/i.test(s) && chaosCur) { chaosCur.ok = true; pushRound(); }
+  else if (/(mismatch|lost quorum|FAIL)/i.test(s) && chaosCur) { chaosCur.ok = false; pushRound(); }
+}
+function pushRound() {
+  if (!chaosCur) return;
+  chaosRounds = chaosRounds.filter(x => x.n !== chaosCur.n);
+  chaosRounds.push({n:chaosCur.n, ok:chaosCur.ok});
+  chaosRounds.sort((a,b)=>a.n-b.n);
+  renderChaos();
+  chaosCur = null;
+}
+function renderChaos(verdict) {
+  const pips = chaosRounds.map(r => `<span class="round-pip ${r.ok?'ok':'bad'}">r${r.n} ${r.ok?'OK':'FAIL'}</span>`).join("");
+  let v = "";
+  if (verdict) v = `<div class="verdict ${verdict.pass?'pass':'fail'}">${verdict.text}</div>`;
+  else v = `<div class="verdict">Chaos running… ${chaosRounds.length} round(s) done</div>`;
+  $("results").innerHTML = v + `<div class="chaos-rounds">${pips}</div>`;
+}
+function finalizeChaos(code) {
+  const bad = chaosRounds.filter(r=>!r.ok).length;
+  renderChaos({pass: code===0 && bad===0, text: (code===0&&bad===0) ? `CHAOS PASSED: ${chaosRounds.length} rounds, zero data loss` : `CHAOS FAILED: ${bad} bad round(s)`});
+}
+
+// ---------- console ----------
+function logLine(cls, s) {
+  const out = $("console-out");
+  const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
+  const div = document.createElement("div");
+  div.className = "cl " + (cls||"");
+  div.textContent = s;
+  out.appendChild(div);
+  while (out.children.length > 600) out.removeChild(out.firstChild);
+  if (atBottom) out.scrollTop = out.scrollHeight;
+}
+function clearConsole(){ $("console-out").innerHTML = ""; }
+
+// ---------- controls ----------
+function setBadge(text, live){ const b=$("run-badge"); b.textContent=text; b.className="run-badge"+(live?" live":""); }
+function setButtons(){
+  $("b-run").disabled = running;
+  $("c-run").disabled = running;
+  $("stop-btn").disabled = !running;
+}
+
+async function startRun(path, params, hintEl) {
+  hintEl.textContent = "";
+  const qs = new URLSearchParams(params).toString();
+  try {
+    const r = await fetch(path + "?" + qs, { method:"POST" });
+    const j = await r.json();
+    if (!r.ok || j.error) hintEl.textContent = j.error || "failed to start";
+  } catch (e) { hintEl.textContent = "control server unreachable"; }
+}
+
+$("b-run").addEventListener("click", () => startRun("/bench", {
+  writers:$("b-writers").value, readers:$("b-readers").value,
+  duration:$("b-duration").value, threshold:$("b-threshold").value
+}, $("b-hint")));
+
+$("c-run").addEventListener("click", () => startRun("/chaos", {
+  rounds:$("c-rounds").value, threshold:$("c-threshold").value
+}, $("c-hint")));
+
+$("stop-btn").addEventListener("click", async () => {
+  $("stop-btn").disabled = true;
+  try { await fetch("/stop", { method:"POST" }); } catch {}
+});
+
+// ---------- live node strip ----------
+function renderNodes(states) {
+  const strip = $("nodes-strip");
+  strip.innerHTML = states.map((s,i) => {
+    const role = s.down ? "down" : (s.data && s.data.role) || "pending";
+    const id = (s.data && s.data.nodeId) || ("n"+(i+1));
+    const stats = s.down ? "offline"
+      : `t=${s.data.term} ci=${s.data.commitIndex}<br>keys=${s.data.keys} snap=${s.data.snapshotIndex}`;
+    return `<div class="nodecell role-${role}"><div class="nc-role">${role}</div><div class="nc-id">${id}</div><div class="nc-stats">${stats}</div></div>`;
+  }).join("");
+}
+async function pollNodes() {
+  const states = await Promise.all(NODE_HTTP.map(async url => {
+    try {
+      const ctrl = new AbortController(); const t=setTimeout(()=>ctrl.abort(),800);
+      const r = await fetch(url+"/status",{signal:ctrl.signal}); clearTimeout(t);
+      if (!r.ok) throw 0;
+      return { data: await r.json() };
+    } catch { return { down:true }; }
+  }));
+  renderNodes(states);
+  setTimeout(pollNodes, 700);
+}
+
+// init
+NODE_HTTP.forEach(()=>{});
+renderNodes(NODE_HTTP.map(()=>({down:true})));
+connectStream();
+pollNodes();
+setButtons();
+</script>
+</body>
+</html>

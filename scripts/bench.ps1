@@ -1,13 +1,18 @@
 # bench.ps1: launch a local cluster, run the benchmark, save a report.
 #
-#   pwsh scripts/bench.ps1 [-N 5] [-Writers 24] [-Readers 16] [-Duration 5s]
+#   pwsh scripts/bench.ps1 [-N 5] [-Writers 24] [-Readers 16] [-Duration 5s] [-Fsync]
+#
+# -Fsync starts the cluster with --fsync so every durable write is flushed to
+# disk before it is acknowledged. Use it to measure the power-loss-durability
+# latency tradeoff against the default (page-cache) mode.
 param(
   [int]$N = 5,
   [int]$Writers = 24,
   [int]$Readers = 16,
   [string]$Duration = "5s",
   [int]$Base = 9001,
-  [int]$Threshold = 2000
+  [int]$Threshold = 2000,
+  [switch]$Fsync
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -20,10 +25,13 @@ $ports = 0..($N-1) | ForEach-Object { $Base + $_ }
 function Node($port) {
   $id = "n$($port - $Base + 1)"
   $peers = ($ports | Where-Object { $_ -ne $port } | ForEach-Object { "localhost:$_" }) -join ","
-  Start-Process .\bin\raftnode.exe -PassThru -WindowStyle Hidden -ArgumentList `
-    "--id",$id,"--addr",":$port","--advertise","localhost:$port","--peers",$peers,`
-    "--read-mode","follower","--data-dir",".\databench\$id","--snapshot-threshold","$Threshold",`
+  $nodeArgs = @(
+    "--id",$id,"--addr",":$port","--advertise","localhost:$port","--peers",$peers,
+    "--read-mode","follower","--data-dir",".\databench\$id","--snapshot-threshold","$Threshold",
     "--http",":$($port - 1000)"
+  )
+  if ($Fsync) { $nodeArgs += "--fsync" }
+  Start-Process .\bin\raftnode.exe -PassThru -WindowStyle Hidden -ArgumentList $nodeArgs
 }
 
 # Kill stale raftnode processes from a prior chaos/bench run (they share ports

@@ -35,9 +35,9 @@ type Persister interface {
 //   - log.jsonl     : one JSON LogEntry per line (append-only; rewritten on
 //     compaction/truncation)
 //
-// Appends are not fsync'd per entry: state survives a process crash (the bytes
-// are handed to the OS) but not power loss. Group-fsync would add power-safety
-// at a latency cost; documented as a deliberate tradeoff.
+// By default appends are not fsync'd per entry: state survives a process crash
+// (the bytes are handed to the OS) but not power loss. Set fsync to trade write
+// latency for power-loss durability.
 type filePersister struct {
 	mu      sync.Mutex
 	dir     string
@@ -46,9 +46,13 @@ type filePersister struct {
 	logF    string
 	logFile *os.File
 	logW    *bufio.Writer
+	// fsync forces each durable write through to the physical disk before
+	// returning. Off by default: writes then reach the OS page cache only, which
+	// survives a process crash but not sudden power loss. See the --fsync flag.
+	fsync bool
 }
 
-func newFilePersister(dataDir string) (*filePersister, error) {
+func newFilePersister(dataDir string, fsync bool) (*filePersister, error) {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -57,6 +61,7 @@ func newFilePersister(dataDir string) (*filePersister, error) {
 		metaF: filepath.Join(dataDir, "meta.json"),
 		snapF: filepath.Join(dataDir, "snapshot.bin"),
 		logF:  filepath.Join(dataDir, "log.jsonl"),
+		fsync: fsync,
 	}
 	f, err := os.OpenFile(p.logF, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -82,9 +87,28 @@ func (p *filePersister) Close() error {
 	return nil
 }
 
-func atomicWrite(path string, data []byte) error {
+// atomicWrite replaces path via a temp file + rename. When fsync is set the
+// temp file is flushed to disk before the rename, so a power loss cannot leave
+// the renamed file pointing at unwritten data.
+func atomicWrite(path string, data []byte, fsync bool) error {
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if fsync {
+		f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		if _, err := f.Write(data); err != nil {
+			f.Close()
+			return err
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			return err
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+	} else if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
@@ -112,7 +136,14 @@ func (p *filePersister) AppendLog(entries []*raftpb.LogEntry) error {
 			return err
 		}
 	}
-	return p.logW.Flush()
+	if err := p.logW.Flush(); err != nil {
+		return err
+	}
+	// The commit path: without this the entry is only in the OS page cache.
+	if p.fsync {
+		return p.logFile.Sync()
+	}
+	return nil
 }
 
 func (p *filePersister) SaveMeta(meta Meta) error {
@@ -122,7 +153,7 @@ func (p *filePersister) SaveMeta(meta Meta) error {
 	if err != nil {
 		return err
 	}
-	return atomicWrite(p.metaF, b)
+	return atomicWrite(p.metaF, b, p.fsync)
 }
 
 func (p *filePersister) Rewrite(meta Meta, snapshot []byte, log []*raftpb.LogEntry) error {
@@ -130,11 +161,11 @@ func (p *filePersister) Rewrite(meta Meta, snapshot []byte, log []*raftpb.LogEnt
 	defer p.mu.Unlock()
 	if b, err := json.Marshal(meta); err != nil {
 		return err
-	} else if err := atomicWrite(p.metaF, b); err != nil {
+	} else if err := atomicWrite(p.metaF, b, p.fsync); err != nil {
 		return err
 	}
 	if snapshot != nil {
-		if err := atomicWrite(p.snapF, snapshot); err != nil {
+		if err := atomicWrite(p.snapF, snapshot, p.fsync); err != nil {
 			return err
 		}
 	}
@@ -153,6 +184,12 @@ func (p *filePersister) Rewrite(meta Meta, snapshot []byte, log []*raftpb.LogEnt
 	if err := w.Flush(); err != nil {
 		f.Close()
 		return err
+	}
+	if p.fsync {
+		if err := f.Sync(); err != nil {
+			f.Close()
+			return err
+		}
 	}
 	f.Close()
 	// Close the current append handle so the rename can replace the file;

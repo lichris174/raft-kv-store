@@ -19,6 +19,7 @@ func main() {
 	dataDir := flag.String("data-dir", "", "directory for durable Raft state (empty = in-memory, no persistence)")
 	snapThreshold := flag.Int("snapshot-threshold", 100, "applied entries past last snapshot before compaction")
 	httpAddr := flag.String("http", "", "HTTP/JSON gateway address for the dashboard (e.g. :8001)")
+	fsync := flag.Bool("fsync", false, "fsync every durable write before acknowledging (survives power loss, costs write latency)")
 	flag.Parse()
 
 	var peers []string
@@ -49,7 +50,7 @@ func main() {
 	if len(peers) > 0 {
 		var persister Persister
 		if *dataDir != "" {
-			fp, err := newFilePersister(*dataDir)
+			fp, err := newFilePersister(*dataDir, *fsync)
 			if err != nil {
 				log.Fatalf("data-dir %s: %v", *dataDir, err)
 			}
@@ -69,7 +70,7 @@ func main() {
 		kv.raft = rf
 		raftpb.RegisterRaftServer(grpcServer, &raftService{r: rf})
 		go rf.Run()
-		log.Printf("node %s raft enabled (advertise=%s, peers=%v, dataDir=%q)", *id, self, peers, *dataDir)
+		log.Printf("node %s raft enabled (advertise=%s, peers=%v, dataDir=%q, fsync=%v)", *id, self, peers, *dataDir, *fsync)
 	}
 
 	if *httpAddr != "" {

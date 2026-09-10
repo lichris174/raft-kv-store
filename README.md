@@ -190,10 +190,19 @@ finding the leader, not lost or corrupted data.
   entries from earlier terms commit along with it (Raft section 5.4.2). An entry counts as
   committed only once it is on a majority and from the current term, which prevents a committed
   entry from being lost after a leader change.
-- **How durable it is.** State is an append-only log plus snapshots. Writes reach the operating
-  system (so they survive a process crash, which is what the chaos test exercises) but are not
-  flushed to the physical disk on every write. Surviving a sudden power loss would need a grouped
-  disk flush, which is a latency tradeoff I chose not to take.
+- **How durable it is.** State is an append-only log plus snapshots. By default writes reach the
+  operating system (so they survive a process crash, which is what the chaos test exercises) but
+  are not flushed to the physical disk on every write, so a sudden power loss can still lose
+  recently acknowledged writes. Start a node with `--fsync` to flush every durable write through
+  to the disk before acknowledging it, which closes that gap at a real cost in write latency:
+
+  | mode | writes/sec | p50 | p95 | p99 |
+  |------|-----------|-----|-----|-----|
+  | default (page cache) | ~7,300 | 2.47 ms | 6.4 ms | 24.4 ms |
+  | `--fsync` | ~1,000 | 21.9 ms | 35.2 ms | 52.0 ms |
+
+  About 7x the throughput for power-loss safety. Reads are unaffected (~31,000/sec either way)
+  since they never touch the disk. Reproduce with `pwsh scripts/bench.ps1 -Fsync`.
 - **Why this beats a naive disk format.** The first version rewrote the entire state on every
   write, which was quadratic and ran at about 98 writes/sec. Switching to an append-only log
   brought it to about 7,900 writes/sec.

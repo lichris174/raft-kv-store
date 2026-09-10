@@ -30,7 +30,7 @@ func TestLoadSanitizesDuplicateBoundaryAndGap(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	p, err := newFilePersister(dir)
+	p, err := newFilePersister(dir, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,4 +64,54 @@ func indicesOf(log []*raftpb.LogEntry) []uint64 {
 		out = append(out, e.Index)
 	}
 	return out
+}
+
+// TestFsyncPersisterRoundTrip exercises the fsync path end to end: every durable
+// write (append, meta, snapshot + log rewrite) goes through an explicit disk
+// flush, and the state still reloads intact.
+func TestFsyncPersisterRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	p, err := newFilePersister(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	entries := []*raftpb.LogEntry{
+		{Term: 1, Index: 1, Op: "set", Key: "a", Value: "1"},
+		{Term: 1, Index: 2, Op: "set", Key: "b", Value: "2"},
+	}
+	if err := p.AppendLog(entries); err != nil {
+		t.Fatalf("AppendLog: %v", err)
+	}
+	if err := p.SaveMeta(Meta{CurrentTerm: 3, VotedFor: "n1"}); err != nil {
+		t.Fatalf("SaveMeta: %v", err)
+	}
+
+	meta, snap, logTail, err := p.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if meta.CurrentTerm != 3 || meta.VotedFor != "n1" {
+		t.Fatalf("meta round-trip: got %+v", meta)
+	}
+	if len(logTail) != 2 || logTail[1].GetKey() != "b" {
+		t.Fatalf("log round-trip: got %d entries %+v", len(logTail), logTail)
+	}
+
+	// Compaction rewrite under fsync: snapshot at index 2, log truncated to the tail.
+	tail := []*raftpb.LogEntry{{Term: 2, Index: 3, Op: "set", Key: "c", Value: "3"}}
+	if err := p.Rewrite(Meta{CurrentTerm: 3, SnapshotIndex: 2, SnapshotTerm: 1}, []byte(`{"a":"1","b":"2"}`), tail); err != nil {
+		t.Fatalf("Rewrite: %v", err)
+	}
+	meta, snap, logTail, err = p.Load()
+	if err != nil {
+		t.Fatalf("Load after rewrite: %v", err)
+	}
+	if meta.SnapshotIndex != 2 || string(snap) != `{"a":"1","b":"2"}` {
+		t.Fatalf("snapshot round-trip: meta=%+v snap=%q", meta, snap)
+	}
+	if len(logTail) != 1 || logTail[0].GetIndex() != 3 {
+		t.Fatalf("tail after rewrite: got %+v", logTail)
+	}
 }

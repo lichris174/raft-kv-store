@@ -77,6 +77,9 @@ type Config struct {
 	SnapshotThreshold int
 	// Persister durably stores Raft state across restarts (nil disables it).
 	Persister Persister
+	// OnPersistFatal is called when a disk write fails at a point where the
+	// in-memory change cannot be rolled back. Nil crash-stops the process.
+	OnPersistFatal func(op string, err error)
 }
 
 func (c Config) withDefaults() Config {
@@ -161,7 +164,9 @@ func (r *Raft) recover() {
 	}
 	meta, snap, logTail, err := r.cfg.Persister.Load()
 	if err != nil {
-		log.Printf("[%s] WARN load persisted state: %v", r.cfg.ID, err)
+		// Starting from blank state after a failed load would forget our term and
+		// vote (a double-vote risk) and our log. Refuse to start instead.
+		r.fatalPersist("load persisted state", err)
 		return
 	}
 	r.currentTerm = meta.CurrentTerm
@@ -192,35 +197,45 @@ func (r *Raft) metaLocked() Meta {
 	return Meta{CurrentTerm: r.currentTerm, VotedFor: r.votedFor, SnapshotIndex: r.snapshotIndex, SnapshotTerm: r.snapshotTerm}
 }
 
+// The persistence helpers return their error. Raft's safety argument assumes a
+// node never acknowledges state (a vote, an appended entry) that is not durable,
+// so callers either roll back and refuse, or, where the in-memory change cannot
+// be undone, crash-stop via fatalPersist. They must never just log and carry on.
+
 // saveMetaLocked persists term/vote/snapshot metadata (small, infrequent).
-func (r *Raft) saveMetaLocked() {
+func (r *Raft) saveMetaLocked() error {
 	if r.cfg.Persister == nil {
-		return
+		return nil
 	}
-	if err := r.cfg.Persister.SaveMeta(r.metaLocked()); err != nil {
-		log.Printf("[%s] WARN saveMeta: %v", r.cfg.ID, err)
-	}
+	return r.cfg.Persister.SaveMeta(r.metaLocked())
 }
 
 // appendLogLocked durably appends new log entries (the write hot path).
-func (r *Raft) appendLogLocked(entries []*raftpb.LogEntry) {
+func (r *Raft) appendLogLocked(entries []*raftpb.LogEntry) error {
 	if r.cfg.Persister == nil || len(entries) == 0 {
-		return
+		return nil
 	}
-	if err := r.cfg.Persister.AppendLog(entries); err != nil {
-		log.Printf("[%s] WARN appendLog: %v", r.cfg.ID, err)
-	}
+	return r.cfg.Persister.AppendLog(entries)
 }
 
 // rewriteLocked persists a full snapshot+log rewrite (rare: compaction,
 // snapshot install, or a log truncation on conflict).
-func (r *Raft) rewriteLocked() {
+func (r *Raft) rewriteLocked() error {
 	if r.cfg.Persister == nil {
+		return nil
+	}
+	return r.cfg.Persister.Rewrite(r.metaLocked(), r.snapshotData, r.logEntries)
+}
+
+// fatalPersist handles a disk failure that cannot be rolled back. Stopping the
+// process is safe in Raft (it is just a crash); acknowledging non-durable state
+// is not. The hook exists so tests can observe the decision.
+func (r *Raft) fatalPersist(op string, err error) {
+	if r.cfg.OnPersistFatal != nil {
+		r.cfg.OnPersistFatal(op, err)
 		return
 	}
-	if err := r.cfg.Persister.Rewrite(r.metaLocked(), r.snapshotData, r.logEntries); err != nil {
-		log.Printf("[%s] WARN rewrite: %v", r.cfg.ID, err)
-	}
+	log.Fatalf("[%s] FATAL %s: %v (refusing to continue with non-durable state)", r.cfg.ID, op, err)
 }
 
 func (r *Raft) Run() {
@@ -321,7 +336,9 @@ func (r *Raft) becomeFollowerLocked(term uint64) {
 		r.failAllWaitersLocked(ErrNotLeader)
 	}
 	if termChanged {
-		r.saveMetaLocked()
+		if err := r.saveMetaLocked(); err != nil {
+			r.fatalPersist("save term", err)
+		}
 	}
 }
 
@@ -333,12 +350,19 @@ func (r *Raft) failAllWaitersLocked(err error) {
 }
 
 func (r *Raft) startElectionLocked() {
-	r.state = Candidate
+	// Always back off for a full timeout, even if the vote cannot be recorded.
+	r.resetElectionDeadlineLocked()
+	prevTerm, prevVote := r.currentTerm, r.votedFor
 	r.currentTerm++
 	r.votedFor = r.cfg.Addr
+	if err := r.saveMetaLocked(); err != nil {
+		// Do not campaign on a term/self-vote we could forget after a restart.
+		r.currentTerm, r.votedFor = prevTerm, prevVote
+		log.Printf("[%s] WARN cannot persist election state, skipping campaign: %v", r.cfg.ID, err)
+		return
+	}
+	r.state = Candidate
 	r.leaderAddr = ""
-	r.resetElectionDeadlineLocked()
-	r.saveMetaLocked()
 
 	term := r.currentTerm
 	lastIdx, lastTerm := r.lastLogLocked()
@@ -378,19 +402,25 @@ func (r *Raft) becomeLeaderLocked() {
 	if r.state == Leader {
 		return
 	}
-	r.state = Leader
-	r.leaderAddr = r.cfg.Addr
 	last := r.lastIndexLocked()
 	// Commit a per-term no-op so prior-term entries commit indirectly and
 	// read-index reads have a committed current-term anchor. applyOp ignores it.
 	noop := &raftpb.LogEntry{Term: r.currentTerm, Index: last + 1, Op: "noop"}
+	if err := r.appendLogLocked([]*raftpb.LogEntry{noop}); err != nil {
+		// A leader that cannot write its own log must not lead; stay a follower
+		// and let another node (or a later election) take over.
+		log.Printf("[%s] WARN cannot persist leader no-op, declining leadership: %v", r.cfg.ID, err)
+		r.state = Follower
+		return
+	}
+	r.state = Leader
+	r.leaderAddr = r.cfg.Addr
 	r.logEntries = append(r.logEntries, noop)
 	for _, p := range r.cfg.Peers {
 		r.nextIndex[p] = last + 1
 		r.matchIndex[p] = 0
 	}
 	r.nextHeartbeat = time.Now().Add(r.cfg.HeartbeatInterval)
-	r.appendLogLocked([]*raftpb.LogEntry{noop})
 	log.Printf("[%s] became LEADER term=%d", r.cfg.ID, r.currentTerm)
 	r.broadcastReplicateLocked()
 }
@@ -565,7 +595,12 @@ func (r *Raft) maybeSnapshotLocked() {
 	r.snapshotTerm = newTerm
 	r.snapshotData = data
 	r.logEntries = tail
-	r.rewriteLocked()
+	if err := r.rewriteLocked(); err != nil {
+		// Safe to continue: the old snapshot and log on disk still contain every
+		// applied entry (Rewrite never destroys them before the new files are in
+		// place), so nothing acknowledged is lost. Compaction is retried later.
+		log.Printf("[%s] WARN compaction not persisted, will retry: %v", r.cfg.ID, err)
+	}
 	log.Printf("[%s] snapshot @ index=%d (compacted %d entries)", r.cfg.ID, r.snapshotIndex, r.snapshotIndex-old)
 }
 
@@ -578,10 +613,13 @@ func (r *Raft) Propose(ctx context.Context, op, key, value string) error {
 	}
 	index := r.lastIndexLocked() + 1
 	entry := &raftpb.LogEntry{Term: r.currentTerm, Index: index, Op: op, Key: key, Value: value}
+	if err := r.appendLogLocked([]*raftpb.LogEntry{entry}); err != nil {
+		r.mu.Unlock()
+		return err // not durable on the leader, so never replicate or acknowledge it
+	}
 	r.logEntries = append(r.logEntries, entry)
 	ch := make(chan error, 1)
 	r.waiters[index] = ch
-	r.appendLogLocked([]*raftpb.LogEntry{entry})
 	r.broadcastReplicateLocked()
 	r.mu.Unlock()
 
@@ -614,10 +652,16 @@ func (r *Raft) RequestVote(_ context.Context, args *raftpb.RequestVoteArgs) (*ra
 	upToDate := args.LastLogTerm > lastTerm ||
 		(args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIdx)
 	if (r.votedFor == "" || r.votedFor == args.CandidateId) && upToDate {
+		prev := r.votedFor
 		r.votedFor = args.CandidateId
+		if err := r.saveMetaLocked(); err != nil {
+			// A vote we might forget after a restart could be granted twice in
+			// one term, so refuse rather than grant an unrecorded vote.
+			r.votedFor = prev
+			return reply, err
+		}
 		r.resetElectionDeadlineLocked()
 		reply.VoteGranted = true
-		r.saveMetaLocked()
 	}
 	return reply, nil
 }
@@ -675,17 +719,38 @@ func (r *Raft) AppendEntries(_ context.Context, args *raftpb.AppendEntriesArgs) 
 	// and lets log gaps form. Persisting first keeps disk and memory consistent.
 	// A conflict truncation needs a full rewrite; a clean append is the hot path.
 	if truncated {
-		r.rewriteLocked()
+		// The in-memory truncation cannot be undone, so a failed rewrite means
+		// disk and memory disagree about acknowledged entries: crash-stop.
+		if err := r.rewriteLocked(); err != nil {
+			r.fatalPersist("rewrite after log conflict", err)
+			return reply, err
+		}
 	} else if len(appended) > 0 {
-		r.appendLogLocked(appended)
+		if err := r.appendLogLocked(appended); err != nil {
+			// Roll back so we never report (or later serve) entries we could not
+			// make durable; the leader sees an RPC error and retries.
+			r.logEntries = r.logEntries[:len(r.logEntries)-len(appended)]
+			return reply, err
+		}
 	}
 
+	// Only entries this very message verified against the leader's log may be
+	// committed. The follower's own last index is not enough: with prevLogIndex=0
+	// (e.g. a read-index heartbeat) the consistency check passes trivially, and
+	// the follower may hold uncommitted entries from an old leader that differ
+	// from the leader's. Raft figure 2: min(leaderCommit, index of last new entry).
 	if args.LeaderCommit > r.commitIndex {
-		r.commitIndex = args.LeaderCommit
-		if last := r.lastIndexLocked(); last < r.commitIndex {
-			r.commitIndex = last
+		newCommit := args.LeaderCommit
+		if verified := args.PrevLogIndex + uint64(len(args.Entries)); verified < newCommit {
+			newCommit = verified
 		}
-		r.applyCommittedLocked()
+		if last := r.lastIndexLocked(); last < newCommit {
+			newCommit = last
+		}
+		if newCommit > r.commitIndex {
+			r.commitIndex = newCommit
+			r.applyCommittedLocked()
+		}
 	}
 
 	reply.Success = true
@@ -711,19 +776,34 @@ func (r *Raft) InstallSnapshot(_ context.Context, args *raftpb.InstallSnapshotAr
 	if args.LastIncludedIndex <= r.snapshotIndex {
 		return reply, nil // stale or duplicate snapshot
 	}
+	if args.LastIncludedIndex <= r.lastApplied {
+		// Our state machine already reflects everything the snapshot covers (and
+		// possibly more). Restoring would roll it back to the older state, and the
+		// entries in between would never be re-applied.
+		return reply, nil
+	}
 
 	if r.cfg.Restore != nil {
 		r.cfg.Restore(args.Data)
 	}
+	// Decide what to do with our log before moving snapshotIndex (entryAtLocked
+	// treats anything at or below it as compacted). If our entry at the snapshot
+	// boundary has a different term, our whole log is from another history and
+	// the tail after it cannot be trusted either.
+	boundary := r.entryAtLocked(args.LastIncludedIndex)
+	keepTail := boundary != nil && boundary.Term == args.LastIncludedTerm
+
 	r.snapshotIndex = args.LastIncludedIndex
 	r.snapshotTerm = args.LastIncludedTerm
 	r.snapshotData = append([]byte(nil), args.Data...)
 
 	// Discard log entries the snapshot now covers.
 	var tail []*raftpb.LogEntry
-	for _, e := range r.logEntries {
-		if e.Index > args.LastIncludedIndex {
-			tail = append(tail, e)
+	if keepTail {
+		for _, e := range r.logEntries {
+			if e.Index > args.LastIncludedIndex {
+				tail = append(tail, e)
+			}
 		}
 	}
 	r.logEntries = tail
@@ -733,7 +813,10 @@ func (r *Raft) InstallSnapshot(_ context.Context, args *raftpb.InstallSnapshotAr
 	if r.lastApplied < args.LastIncludedIndex {
 		r.lastApplied = args.LastIncludedIndex
 	}
-	r.rewriteLocked()
+	if err := r.rewriteLocked(); err != nil {
+		r.fatalPersist("persist installed snapshot", err)
+		return reply, err
+	}
 	log.Printf("[%s] installed snapshot @ index=%d term=%d", r.cfg.ID, r.snapshotIndex, r.snapshotTerm)
 	return reply, nil
 }

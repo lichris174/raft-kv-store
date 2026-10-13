@@ -294,3 +294,81 @@ func TestInstallSnapshot_TermMatchKeepsLogTail(t *testing.T) {
 		t.Fatalf("snapshotIndex=%d logLen=%d, want 2/1 (entry 3 matches and must be kept)", s.SnapshotIndex, s.LogLen)
 	}
 }
+
+// --- Disruption resistance: a rejoining node must not depose a healthy leader ---
+
+// A follower that heard from a leader within the minimum election timeout must
+// ignore a vote request for a higher term (Raft dissertation 4.2.3). Without
+// this, one node that was cut off and kept campaigning bumps the term and forces
+// the healthy leader to step down the moment it reconnects.
+func TestRequestVote_IgnoredWhileLeaderIsAlive(t *testing.T) {
+	r, _ := soloNode(nil, nil)
+	mustAppend(t, r, &raftpb.AppendEntriesArgs{Term: 1, LeaderId: "L"})
+
+	reply, err := r.RequestVote(context.Background(), &raftpb.RequestVoteArgs{Term: 5, CandidateId: "n1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.VoteGranted {
+		t.Fatal("granted a vote while a leader was alive")
+	}
+	if s := r.StatusSnapshot(); s.Term != 1 {
+		t.Fatalf("term=%d, want 1: a disruptive candidate must not bump our term", s.Term)
+	}
+}
+
+// Once the leader has been silent for the minimum election timeout, votes flow.
+func TestRequestVote_GrantedAfterLeaderGoesSilent(t *testing.T) {
+	r, _ := soloNode(nil, nil)
+	mustAppend(t, r, &raftpb.AppendEntriesArgs{Term: 1, LeaderId: "L"})
+	time.Sleep(r.cfg.ElectionTimeoutMin + 30*time.Millisecond)
+
+	reply, err := r.RequestVote(context.Background(), &raftpb.RequestVoteArgs{Term: 2, CandidateId: "n1"})
+	if err != nil || !reply.VoteGranted {
+		t.Fatalf("vote not granted after leader silence: %+v %v", reply, err)
+	}
+}
+
+// A leader that is in contact with a majority also ignores higher-term requests.
+func TestRequestVote_LeaderWithQuorumIgnoresDisruptor(t *testing.T) {
+	net := newInmemNet()
+	nodes, _ := buildCluster(net, 3)
+	for _, r := range nodes {
+		go r.Run()
+		defer r.Stop()
+	}
+	leader := waitForLeader(t, nodes, nil, 2*time.Second)
+	term := leader.StatusSnapshot().Term
+	time.Sleep(60 * time.Millisecond) // let heartbeats establish contact
+
+	reply, _ := leader.RequestVote(context.Background(), &raftpb.RequestVoteArgs{
+		Term: term + 5, CandidateId: "x", LastLogIndex: 1 << 20, LastLogTerm: 1 << 20,
+	})
+	if reply.VoteGranted || !leader.IsLeader() {
+		t.Fatalf("healthy leader deposed by a disruptive candidate: granted=%v leader=%v", reply.VoteGranted, leader.IsLeader())
+	}
+}
+
+// Check-quorum: a leader that cannot reach a majority must stop calling itself
+// leader, otherwise it shows as one forever and clients keep writing to it.
+func TestLeader_StepsDownWhenIsolated(t *testing.T) {
+	net := newInmemNet()
+	nodes, _ := buildCluster(net, 3)
+	for _, r := range nodes {
+		go r.Run()
+		defer r.Stop()
+	}
+	leader := waitForLeader(t, nodes, nil, 2*time.Second)
+	// inmemNet only blocks traffic *to* a node, so cut every node, the leader
+	// included, to get a real two-way partition around it.
+	for _, r := range nodes {
+		net.setDown(r.cfg.Addr, true)
+	}
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) && leader.IsLeader() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if leader.IsLeader() {
+		t.Fatal("isolated leader never stepped down")
+	}
+}

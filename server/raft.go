@@ -134,6 +134,13 @@ type Raft struct {
 	electionDeadline time.Time
 	nextHeartbeat    time.Time
 
+	// lastLeaderContact is when we last accepted AppendEntries/InstallSnapshot
+	// from a current leader. lastAck is, for a leader, when each peer last
+	// answered us. Together they let a node refuse to be disrupted while a
+	// leader is healthy, and let a leader notice it has lost its majority.
+	lastLeaderContact time.Time
+	lastAck           map[string]time.Time
+
 	stopCh  chan struct{}
 	stopped bool
 }
@@ -149,6 +156,7 @@ func NewRaft(cfg Config, trans Transport) *Raft {
 		state:      Follower,
 		nextIndex:  map[string]uint64{},
 		matchIndex: map[string]uint64{},
+		lastAck:    map[string]time.Time{},
 		waiters:    map[uint64]chan error{},
 		stopCh:     make(chan struct{}),
 	}
@@ -265,6 +273,16 @@ func (r *Raft) tick() {
 	defer r.mu.Unlock()
 	now := time.Now()
 	if r.state == Leader {
+		if !r.quorumContactLocked(now, r.cfg.ElectionTimeoutMax) {
+			// Check-quorum: a leader that has not heard from a majority for a full
+			// election timeout cannot commit anything and a new leader may already
+			// exist. Step down so clients and the dashboard stop treating it as one.
+			log.Printf("[%s] lost contact with a majority, stepping down (term=%d)", r.cfg.ID, r.currentTerm)
+			r.becomeFollowerLocked(r.currentTerm)
+			r.leaderAddr = ""
+			r.resetElectionDeadlineLocked()
+			return
+		}
 		if now.After(r.nextHeartbeat) {
 			r.nextHeartbeat = now.Add(r.cfg.HeartbeatInterval)
 			r.broadcastReplicateLocked()
@@ -318,6 +336,29 @@ func (r *Raft) termAtLocked(index uint64) uint64 {
 		return e.Term
 	}
 	return 0
+}
+
+// quorumContactLocked reports whether, counting itself, a majority of the
+// cluster has answered this leader within the window.
+func (r *Raft) quorumContactLocked(now time.Time, window time.Duration) bool {
+	n := 1
+	for _, p := range r.cfg.Peers {
+		if now.Sub(r.lastAck[p]) < window {
+			n++
+		}
+	}
+	return n >= r.majorityLocked()
+}
+
+// hasLiveLeaderLocked is true while this node should believe a leader is
+// healthy: a leader still in touch with a majority, or a follower that heard
+// from one within the minimum election timeout.
+func (r *Raft) hasLiveLeaderLocked() bool {
+	now := time.Now()
+	if r.state == Leader {
+		return r.quorumContactLocked(now, r.cfg.ElectionTimeoutMin)
+	}
+	return r.leaderAddr != "" && now.Sub(r.lastLeaderContact) < r.cfg.ElectionTimeoutMin
 }
 
 func (r *Raft) majorityLocked() int { return (len(r.cfg.Peers)+1)/2 + 1 }
@@ -416,11 +457,13 @@ func (r *Raft) becomeLeaderLocked() {
 	r.state = Leader
 	r.leaderAddr = r.cfg.Addr
 	r.logEntries = append(r.logEntries, noop)
+	now := time.Now()
 	for _, p := range r.cfg.Peers {
 		r.nextIndex[p] = last + 1
 		r.matchIndex[p] = 0
+		r.lastAck[p] = now // grace: the election just proved a majority was reachable
 	}
-	r.nextHeartbeat = time.Now().Add(r.cfg.HeartbeatInterval)
+	r.nextHeartbeat = now.Add(r.cfg.HeartbeatInterval)
 	log.Printf("[%s] became LEADER term=%d", r.cfg.ID, r.currentTerm)
 	r.broadcastReplicateLocked()
 }
@@ -480,6 +523,7 @@ func (r *Raft) replicateToLocked(peer string) {
 			r.becomeFollowerLocked(reply.Term)
 			return
 		}
+		r.lastAck[peer] = time.Now()
 		if reply.Success {
 			match := prevIndex + uint64(len(entries))
 			if match > r.matchIndex[peer] {
@@ -523,6 +567,7 @@ func (r *Raft) sendSnapshotLocked(peer string) {
 			r.becomeFollowerLocked(reply.Term)
 			return
 		}
+		r.lastAck[peer] = time.Now()
 		if sidx > r.matchIndex[peer] {
 			r.matchIndex[peer] = sidx
 			r.nextIndex[peer] = sidx + 1
@@ -643,6 +688,13 @@ func (r *Raft) RequestVote(_ context.Context, args *raftpb.RequestVoteArgs) (*ra
 	if args.Term < r.currentTerm {
 		return reply, nil
 	}
+	// Leader stickiness (Raft dissertation 4.2.3): while a leader is healthy,
+	// ignore vote requests outright, without adopting the higher term. Otherwise a
+	// node that was cut off and kept campaigning would depose the working leader
+	// the moment it reconnected.
+	if args.Term > r.currentTerm && r.hasLiveLeaderLocked() {
+		return reply, nil
+	}
 	if args.Term > r.currentTerm {
 		r.becomeFollowerLocked(args.Term)
 	}
@@ -679,6 +731,7 @@ func (r *Raft) AppendEntries(_ context.Context, args *raftpb.AppendEntriesArgs) 
 		r.state = Follower
 	}
 	r.leaderAddr = args.LeaderId
+	r.lastLeaderContact = time.Now()
 	r.resetElectionDeadlineLocked()
 	reply.Term = r.currentTerm
 
@@ -770,6 +823,7 @@ func (r *Raft) InstallSnapshot(_ context.Context, args *raftpb.InstallSnapshotAr
 		r.state = Follower
 	}
 	r.leaderAddr = args.LeaderId
+	r.lastLeaderContact = time.Now()
 	r.resetElectionDeadlineLocked()
 	reply.Term = r.currentTerm
 

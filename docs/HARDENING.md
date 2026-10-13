@@ -18,7 +18,7 @@ what the fix is and why it is correct, and how it was verified. Branch:
 4. **Fix**, re-run everything (GREEN), then re-verify against the real cluster with
    chaos and the benchmark.
 
-The baseline suite had 20 tests. It is now 35 (15 added), none removed.
+The baseline suite had 20 tests. It is now 41, none removed.
 
 ## Fixes
 
@@ -189,6 +189,47 @@ leader once, yet the README claims zero data loss when the leader is killed.
 - The control server accepts `killLeader=1` on `/chaos` and the control dashboard
   has an "Always kill the leader" checkbox.
 
+### Step 4: a rejoining node must not depose the leader
+
+**How it was found.** Not by the test suite, but by watching the redesigned dashboard
+([`UI_REDESIGN.md`](UI_REDESIGN.md)): after restarting a killed node the term climbed from 4 to
+13 within seconds. The node logs showed the restarted node campaigning once a second and the
+healthy leader repeatedly winning and losing leadership. Chaos passed throughout because it
+only checks that data survives, not that the cluster stays calm.
+
+**Causes.**
+
+1. The leader's gRPC channel to the restarted node sat in the default reconnect backoff
+   (which grows toward two minutes), so heartbeats did not reach it.
+2. With no heartbeats the node timed out, bumped its term and asked for votes. A node that
+   receives a higher term must adopt it, so the healthy leader stepped down every time.
+   Raft has no defense against this without pre-vote or leader stickiness.
+
+**Fixes** (`raft.go`, `transport.go`):
+
+- **Fast reconnect.** Peer connections retry with a 50 ms base and 500 ms cap instead of the
+  gRPC default.
+- **Leader stickiness** (Raft dissertation 4.2.3). A follower that heard from a leader within
+  the minimum election timeout, and a leader still in contact with a majority, ignore vote
+  requests for a higher term without adopting it.
+- **Check-quorum.** A leader that has heard from no majority for a full election timeout steps
+  down. This also fixes an isolated leader showing as leader forever.
+
+Pre-vote (a dry-run election before bumping the term) is the complete answer and is still not
+implemented; it needs a protobuf change. The two fixes above remove the observed storm.
+
+**Tests (RED first):** `TestRequestVote_IgnoredWhileLeaderIsAlive`,
+`TestRequestVote_LeaderWithQuorumIgnoresDisruptor`, `TestLeader_StepsDownWhenIsolated`, plus
+`TestRequestVote_GrantedAfterLeaderGoesSilent` to prove votes still flow once a leader is gone.
+The isolation test first passed for the wrong reason: the in-memory test network only blocks
+traffic *to* a node, so the isolated nodes could still depose the leader. It was changed to cut
+every node, which made it fail correctly before the fix.
+
+**Live check.** Kill the leader and restart it, three times: the term rose by exactly one per
+kill (terms 2, 3, 4 across three leader kills), where before it rose by
+about ten per restart. The restarted node logged zero elections. Eight-round leader-kill chaos
+passes with all nodes converging.
+
 ## Verification
 
 Environment: Windows 11, Go 1.26.4, 5 nodes on loopback.
@@ -196,7 +237,7 @@ Environment: Windows 11, Go 1.26.4, 5 nodes on loopback.
 | Check | Before | After |
 |---|---|---|
 | `go build ./...`, `go vet ./...` | clean | clean |
-| `go test ./...` | 20 pass | 35 pass |
+| `go test ./...` | 20 pass | 41 pass (includes 2 new control-server tests) |
 | Chaos, random victim | 6 rounds pass | not rerun (superseded by next row) |
 | Chaos, `-KillLeader`, 8 rounds, snapshot threshold 25 | not possible | 8 leaders killed, 8 rounds pass, all 5 nodes converge on 38 keys |
 | Benchmark writes (24 writers, 4s, 2 runs each) | 7,000 and 7,186 ops/s | 6,502 and 7,006 ops/s |
@@ -232,10 +273,11 @@ Found in the audit, deliberately left for later rounds:
   so a large snapshot can never finish. Needs chunking or a longer timeout.
 - **Replication** re-sends the whole tail on every proposal with no in-flight limit
   or batch cap; compaction and snapshotting run under the Raft mutex and stall RPCs.
-- **No check-quorum or pre-vote**, so a partitioned leader keeps showing as leader.
+- **No pre-vote.** Stickiness and check-quorum (step 4) cover the observed cases; pre-vote
+  would need a protobuf change.
 - **The race detector does not run** here: MinGW's `gcc` is 32-bit. A 64-bit
   toolchain would let `go test -race` cover the lock-heavy code.
-- **Security:** the HTTP gateway and control server bind to all interfaces with
-  open CORS and mutate over GET; `/stop` kills every `raftnode` process.
+- **Security:** the node HTTP gateway still mutates over GET with open CORS and binds to all
+  interfaces. (The control server was fixed in the UI redesign.)
 - **Docs and polish:** `SPEC.md` does not contain the rules and bug history the
-  README points to; dashboard kill/restart buttons; CI; license.
+  README points to; CI; license. (Dashboard kill/restart buttons shipped in the UI redesign.)

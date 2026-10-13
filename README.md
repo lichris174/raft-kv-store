@@ -123,6 +123,10 @@ Starts a 5-node cluster, writes some canary data, then repeatedly kills and rest
 nodes. After every round it checks that the data is still readable and a leader has re-formed. It
 exits with an error if any committed data was lost.
 
+Add `-KillLeader` to kill the current leader every round instead of a random node, and the run
+finishes by checking that every node converged on the same data. The fixes this harness drove
+are written up in [`docs/HARDENING.md`](docs/HARDENING.md).
+
 ## Benchmarks
 
 ```powershell

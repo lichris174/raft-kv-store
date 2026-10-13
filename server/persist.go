@@ -2,7 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -27,6 +30,33 @@ type Persister interface {
 	SaveMeta(meta Meta) error
 	Rewrite(meta Meta, snapshot []byte, log []*raftpb.LogEntry) error
 	Load() (Meta, []byte, []*raftpb.LogEntry, error)
+}
+
+// snapshot.bin is self-describing: a magic string, the snapshot's last included
+// index and term, then the state-machine payload. Compaction rewrites three
+// files (snapshot, log, meta) and a crash can land between any two of them. If
+// the snapshot carried no index of its own, a new snapshot paired with a stale
+// meta.json would be restored under the old index and entries already folded
+// into it would be re-applied over newer state. Files from older builds have no
+// header and are read as before, with the index taken from meta.json.
+const snapMagic = "RKVSNAP1"
+const snapHeaderLen = len(snapMagic) + 16
+
+func encodeSnapshot(index, term uint64, data []byte) []byte {
+	b := make([]byte, 0, snapHeaderLen+len(data))
+	b = append(b, snapMagic...)
+	b = binary.BigEndian.AppendUint64(b, index)
+	b = binary.BigEndian.AppendUint64(b, term)
+	return append(b, data...)
+}
+
+// decodeSnapshot reports ok=false for a headerless (legacy) file.
+func decodeSnapshot(b []byte) (index, term uint64, data []byte, ok bool) {
+	if len(b) < snapHeaderLen || string(b[:len(snapMagic)]) != snapMagic {
+		return 0, 0, b, false
+	}
+	off := len(snapMagic)
+	return binary.BigEndian.Uint64(b[off:]), binary.BigEndian.Uint64(b[off+8:]), b[snapHeaderLen:], true
 }
 
 // filePersister keeps three files in a data dir:
@@ -156,20 +186,43 @@ func (p *filePersister) SaveMeta(meta Meta) error {
 	return atomicWrite(p.metaF, b, p.fsync)
 }
 
+// writeSnapshotFileLocked atomically replaces snapshot.bin with a self-describing
+// snapshot for meta.SnapshotIndex/SnapshotTerm.
+func (p *filePersister) writeSnapshotFileLocked(meta Meta, snap []byte) error {
+	return atomicWrite(p.snapF, encodeSnapshot(meta.SnapshotIndex, meta.SnapshotTerm, snap), p.fsync)
+}
+
+// Rewrite persists compaction, snapshot install or a log truncation.
+//
+// Order matters for crash safety: snapshot, then log, then meta. Each step
+// leaves a state Load can reconcile:
+//   - snapshot new, log old: the old log is a superset of the new tail; Load
+//     adopts the snapshot's own index and drops the entries it covers.
+//   - snapshot new, log new, meta old: same, the snapshot header wins.
+//
+// Writing meta first (the old order) could record a snapshot index that the
+// snapshot file on disk did not yet reflect, which silently loses state.
 func (p *filePersister) Rewrite(meta Meta, snapshot []byte, log []*raftpb.LogEntry) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if b, err := json.Marshal(meta); err != nil {
-		return err
-	} else if err := atomicWrite(p.metaF, b, p.fsync); err != nil {
+	metaJSON, err := json.Marshal(meta)
+	if err != nil {
 		return err
 	}
 	if snapshot != nil {
-		if err := atomicWrite(p.snapF, snapshot, p.fsync); err != nil {
+		if err := p.writeSnapshotFileLocked(meta, snapshot); err != nil {
 			return err
 		}
 	}
-	// Rewrite the log file from scratch with the current tail.
+	if err := p.swapLogLocked(log); err != nil {
+		return err
+	}
+	return atomicWrite(p.metaF, metaJSON, p.fsync)
+}
+
+// swapLogLocked replaces log.jsonl with exactly the given entries and reopens
+// the append handle. Caller holds p.mu.
+func (p *filePersister) swapLogLocked(log []*raftpb.LogEntry) error {
 	tmp := p.logF + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
@@ -177,7 +230,11 @@ func (p *filePersister) Rewrite(meta Meta, snapshot []byte, log []*raftpb.LogEnt
 	}
 	w := bufio.NewWriter(f)
 	for _, e := range log {
-		b, _ := json.Marshal(e)
+		b, err := json.Marshal(e)
+		if err != nil {
+			f.Close()
+			return err
+		}
 		w.Write(b)
 		w.WriteByte('\n')
 	}
@@ -209,9 +266,9 @@ func (p *filePersister) Rewrite(meta Meta, snapshot []byte, log []*raftpb.LogEnt
 	// is denied"; the lock clears within a few millis.
 	if err := renameWithRetry(tmp, p.logF); err != nil {
 		// Could not swap. The original log.jsonl is intact and is a superset of
-		// the compacted tail (Load sanitizes the extra head against the new
-		// snapshot index), so reopen it and keep running rather than wedging the
-		// persister. Next compaction retries the swap.
+		// the new tail (Load reconciles the extra head against the snapshot's
+		// index), so reopen it and keep running rather than wedging the
+		// persister. The next compaction retries the swap.
 		_ = os.Remove(tmp)
 		if rErr := p.reopenAppendLocked(); rErr != nil {
 			return rErr
@@ -251,22 +308,42 @@ func (p *filePersister) Load() (Meta, []byte, []*raftpb.LogEntry, error) {
 	defer p.mu.Unlock()
 	var meta Meta
 	if b, err := os.ReadFile(p.metaF); err == nil {
-		_ = json.Unmarshal(b, &meta)
+		// A meta.json that exists but cannot be parsed is an error, not an empty
+		// state: silently resetting the term and votedFor would let this node vote
+		// twice in a term it has already voted in.
+		if err := json.Unmarshal(b, &meta); err != nil {
+			return Meta{}, nil, nil, fmt.Errorf("corrupt %s: %w", p.metaF, err)
+		}
 	} else if !os.IsNotExist(err) {
 		return meta, nil, nil, err
 	}
 	var snap []byte
 	if b, err := os.ReadFile(p.snapF); err == nil {
-		snap = b
+		hIndex, hTerm, payload, ok := decodeSnapshot(b)
+		snap = payload
+		if ok {
+			switch {
+			case hIndex > meta.SnapshotIndex:
+				// Crash after the snapshot was written but before meta.json was:
+				// the snapshot is the newer truth.
+				meta.SnapshotIndex, meta.SnapshotTerm = hIndex, hTerm
+			case hIndex < meta.SnapshotIndex:
+				return Meta{}, nil, nil, fmt.Errorf("%s (index %d) is older than meta.json (index %d)", p.snapF, hIndex, meta.SnapshotIndex)
+			}
+		}
 	} else if !os.IsNotExist(err) {
 		return meta, nil, nil, err
 	}
 	var raw []*raftpb.LogEntry
+	nonEmpty := 0
+	endsClean := true
 	if b, err := os.ReadFile(p.logF); err == nil {
+		endsClean = len(b) == 0 || b[len(b)-1] == '\n'
 		for _, line := range splitLines(b) {
-			if len(line) == 0 {
+			if len(bytes.TrimSpace(line)) == 0 {
 				continue
 			}
+			nonEmpty++
 			var e raftpb.LogEntry
 			if json.Unmarshal(line, &e) == nil {
 				raw = append(raw, &e)
@@ -291,6 +368,15 @@ func (p *filePersister) Load() (Meta, []byte, []*raftpb.LogEntry, error) {
 		}
 		log = append(log, e)
 		expect++
+	}
+	// Repair the file so it matches what we just accepted. Otherwise a torn last
+	// line (crash mid-append) or a dropped post-gap tail stays on disk, the next
+	// append lands behind it, and those later entries are discarded again on the
+	// following restart even though they were acknowledged.
+	if len(log) != nonEmpty || !endsClean {
+		if err := p.swapLogLocked(log); err != nil {
+			return Meta{}, nil, nil, fmt.Errorf("repair %s: %w", p.logF, err)
+		}
 	}
 	return meta, snap, log, nil
 }

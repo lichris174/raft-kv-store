@@ -5,12 +5,17 @@
 # committed data is still readable and the cluster re-elects a leader. Proves
 # crash/restart recovery with no data loss.
 #
-#   pwsh scripts/chaos.ps1 [-Rounds 10]
+#   pwsh scripts/chaos.ps1 [-Rounds 10] [-KillLeader]
+#
+# -KillLeader kills the current leader every round instead of a random node, which
+# is the case the 'no committed write is lost on leader failure' claim rests on.
+# A random victim only hits the leader about 1 round in N.
 param(
   [int]$Rounds = 10,
   [int]$Base = 9001,
   [int]$N = 5,
-  [int]$Threshold = 25
+  [int]$Threshold = 25,
+  [switch]$KillLeader
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -60,8 +65,11 @@ Write-Host "wrote $($canary.Count) canary keys"
 $rng = [Random]::new()
 $failures = 0
 for ($r=1; $r -le $Rounds; $r++) {
-  $victim = $ports[$rng.Next($ports.Count)]
-  Write-Host "`n-- round $r/$Rounds : killing :$victim ($(IdOf $victim)) --" -ForegroundColor Yellow
+  $victim = $null
+  if ($KillLeader) { $victim = WaitLeader }
+  $role = "leader"
+  if (-not $victim) { $victim = $ports[$rng.Next($ports.Count)]; $role = "random node" }
+  Write-Host "`n-- round $r/$Rounds : killing :$victim ($(IdOf $victim), $role) --" -ForegroundColor Yellow
   try { Stop-Process -Id $procs[$victim].Id -Force -ErrorAction Stop } catch {}
   Start-Sleep -Milliseconds 800
 
@@ -97,6 +105,23 @@ for ($r=1; $r -le $Rounds; $r++) {
   }
   if ($bad -eq 0) { Write-Host "  integrity OK ($($canary.Count) keys tracked)" -ForegroundColor Green } else { $failures++ }
 }
+
+# Convergence: after the last restart every node, not just the leader, must hold
+# the full canary set. Wait for the restarted node to catch up, then compare.
+Write-Host "`n== convergence check ==" -ForegroundColor Cyan
+$want = $canary.Count
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$counts = @()
+do {
+  Start-Sleep -Milliseconds 300
+  $counts = $ports | ForEach-Object {
+    $st = & $ctl -addr ":$_" status 2>$null
+    if ($st -match "keys=(\d+)") { [int]$Matches[1] } else { -1 }
+  }
+  $converged = (@($counts | Where-Object { $_ -lt $want }).Count -eq 0) -and (@($counts | Select-Object -Unique).Count -eq 1)
+} while (-not $converged -and $sw.ElapsedMilliseconds -lt 8000)
+if ($converged) { Write-Host "  all $N nodes hold $($counts[0]) keys (>= $want tracked)" -ForegroundColor Green }
+else { Write-Host "  FAIL: nodes diverge or lag: keys per node = $($counts -join ', '), tracked >= $want" -ForegroundColor Red; $failures++ }
 
 Write-Host "`n== cleanup ==" -ForegroundColor Cyan
 foreach ($p in $procs.Values) { try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch {} }

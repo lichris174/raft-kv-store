@@ -249,6 +249,9 @@ func main() {
 			"-Rounds", clampInt(q.Get("rounds"), 1, 100, 8),
 			"-Threshold", clampInt(q.Get("threshold"), 5, 100000, 25),
 		}
+		if q.Get("killLeader") == "1" {
+			args = append(args, "-KillLeader")
+		}
 		if err := h.start("chaos", filepath.Join("scripts", "chaos.ps1"), args); err != nil {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return

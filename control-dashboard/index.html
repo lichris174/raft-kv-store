@@ -127,6 +127,7 @@
       <div class="field-grid">
         <div class="field"><label>Rounds</label><input id="c-rounds" value="8" inputmode="numeric"></div>
         <div class="field"><label>Snapshot threshold</label><input id="c-threshold" value="25" inputmode="numeric"></div>
+        <div class="field full"><label><input type="checkbox" id="c-killleader" style="width:auto;margin-right:6px">Always kill the leader</label></div>
       </div>
       <div class="btn-row">
         <button class="btn btn-danger" id="c-run">Run chaos</button>
@@ -320,7 +321,8 @@ $("b-run").addEventListener("click", () => startRun("/bench", {
 }, $("b-hint")));
 
 $("c-run").addEventListener("click", () => startRun("/chaos", {
-  rounds:$("c-rounds").value, threshold:$("c-threshold").value
+  rounds:$("c-rounds").value, threshold:$("c-threshold").value,
+  killLeader:$("c-killleader").checked ? "1" : "0"
 }, $("c-hint")));
 
 $("stop-btn").addEventListener("click", async () => {

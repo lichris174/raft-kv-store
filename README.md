@@ -70,7 +70,7 @@ proto/       gRPC service definitions and generated Go (the client KV API plus i
 server/      the Raft core (no networking in it), the KV store, and the gRPC and HTTP servers
 client/      a CLI that automatically follows the leader
 benchmark/   a load generator that reports throughput and latency percentiles
-dashboard/   a static HTML/JS page that polls each node's HTTP endpoint
+dashboard/   the web UI (plain HTML, CSS and JS, no build step) that polls each node's HTTP endpoint
 scripts/     chaos.ps1 (fault injection) and bench.ps1 (benchmark runner)
 docker-compose.yml   a 5-node cluster plus the dashboard
 ```
@@ -112,6 +112,8 @@ docker compose up --build
 
 Five nodes (gRPC `:9001-9005`, HTTP `:8001-8005`) plus the dashboard on `:8080`. Stop a container
 (`docker compose stop node3`) and watch the dashboard re-elect and recover in real time.
+Under Docker the page is a read-only view with the key-value box; node kill/start buttons and the
+tests need the control server (see Dashboard below).
 
 ## Fault injection
 
@@ -158,28 +160,41 @@ because every committed write appends to an on-disk log. Expect lower throughput
 slower disk. On separate physical machines, network round-trips would dominate write latency instead
 of the local CPU and disk.
 
-## Control dashboard (benchmark and chaos in the browser)
+## Dashboard (run, break and test the cluster in the browser)
 
-A small Go server (`control/main.go`) runs the benchmark and chaos harnesses from a web UI
-instead of the terminal. It launches the PowerShell harnesses as child processes and streams
-their output to the page over Server-Sent Events, since a browser cannot spawn a process or
-speak gRPC on its own. The page shows live throughput and latency, a pass/fail strip for chaos
-rounds, a node grid that updates while the cluster runs, and the raw log.
+One page does everything: it shows the five nodes, lets you read and write keys, kill and restart
+individual nodes, and run the load and fault tests. A banner says in plain words whether the
+cluster still has a majority, each node row draws its log (snapshot, committed, not yet
+committed), and a feed lists what just happened (elections, failures, log compaction).
 
 ```powershell
 go build -o bin/raftnode.exe    ./server
 go build -o bin/raftctl.exe     ./client
 go build -o bin/raftbench.exe   ./benchmark
 go build -o bin/raftcontrol.exe ./control
-./bin/raftcontrol.exe   # serves http://localhost:8090
+./bin/raftcontrol.exe   # serves http://127.0.0.1:8090
 ```
 
-Open `http://localhost:8090`, set the parameters (writers, readers, duration, snapshot
-threshold, or chaos rounds), and run. One run executes at a time, and Stop kills it and clears
-any leftover nodes. A low chaos snapshot threshold (say 25) forces aggressive log compaction,
-which is the path that stresses snapshot and restore the most.
+Open `http://127.0.0.1:8090`, press **Start cluster**, then try the demo:
 
-A run usually reports a small number of write/read errors, about one per worker thread
+1. Press **Write 100 random keys** and watch every node's log bar grow, then fold into a snapshot.
+2. Press **Kill** on the node marked Leader. The banner goes to Degraded, an election appears in
+   the feed, and a new leader takes over within about a second. Writes keep working.
+3. Press **Start** on that node. It rejoins from its saved data and catches up. The term goes up
+   by one per leader change, not more.
+4. Use **Read from** to read a key from a specific node and see that every replica has it.
+
+The control server owns the demo nodes (it launches them as child processes), so the kill and
+start buttons are real process kills, the same as a crash. It listens on loopback only and every
+endpoint that changes anything requires POST. The page also works without it (for example under
+`docker compose up`), as a read-only view with the key-value box. See
+[`docs/UI_REDESIGN.md`](docs/UI_REDESIGN.md) for the design reasoning.
+
+Running a test starts its own temporary cluster on the same ports, so the demo cluster is stopped
+while a test runs. A low fault-test snapshot threshold forces aggressive log compaction, which is
+the path that stresses snapshot and restore the most.
+
+A load test usually reports a small number of write/read errors, about one per worker thread
 (for example 24 errors with 24 writers). That is expected and benign: each worker's first
 request can land before it has routed to the current leader, so it fails once, re-routes via
 the leader hint, and then succeeds for the rest of the run. It is the client correctly

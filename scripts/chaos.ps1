@@ -1,104 +1,128 @@
 # chaos.ps1: fault-injection harness for the raft-kv-store.
 #
-# Launches a local 5-node cluster (with persistence), writes canary data, then
-# repeatedly kills and restarts a random node, verifying after every round that
-# committed data is still readable and the cluster re-elects a leader. Proves
-# crash/restart recovery with no data loss.
+# Launches a local 5-node cluster with persistence and writes canary keys. Each
+# round then kills a node (a random one, or the leader with -KillLeader), checks
+# the survivors elect a leader and accept a write, restarts the victim, and reads
+# back EVERY acknowledged key. At the end all nodes must hold identical data
+# (the same state digest). Passing proves no acknowledged write was lost.
 #
-#   pwsh scripts/chaos.ps1 [-Rounds 10]
+#   powershell -File scripts\chaos.ps1 [-Rounds 10] [-KillLeader] [-Seed N]
+#
+# The victims are chosen from -Seed (printed at the start), so a failing run can
+# be replayed with the same sequence of kills.
+#
+# Output contract, parsed by dashboard/tests.js (keep the two in sync):
+#   ROUND <r> KILL <nX> (<leader|random node>)
+#   ROUND <r> RESULT=OK|FAIL <details>
+#   CONVERGENCE RESULT=OK|FAIL <details>
+#   CHAOS RESULT=PASS|FAIL <details>
 param(
   [int]$Rounds = 10,
   [int]$Base = 9001,
   [int]$N = 5,
-  [int]$Threshold = 25
+  [int]$Threshold = 25,
+  [switch]$KillLeader,
+  [int]$Seed = (Get-Random),
+  # Outside OneDrive on purpose: sync clients lock files while nodes rewrite them.
+  [string]$DataRoot = (Join-Path $env:TEMP "raft-kv-store\chaos")
 )
 $ErrorActionPreference = "Stop"
-$root = Split-Path -Parent $PSScriptRoot
-Set-Location $root
-$node = ".\bin\raftnode.exe"
-$ctl  = ".\bin\raftctl.exe"
-if (-not (Test-Path $node)) { throw "build first: go build -o bin\raftnode.exe ./server" }
+. "$PSScriptRoot\lib.ps1"
+Assert-Built raftnode
+New-Cluster -Base $Base -N $N -DataRoot $DataRoot -Threshold $Threshold
 
-$ports = 0..($N-1) | ForEach-Object { $Base + $_ }
-function PeersOf($port) { ($ports | Where-Object { $_ -ne $port } | ForEach-Object { "localhost:$_" }) -join "," }
-function IdOf($port) { "n$($port - $Base + 1)" }
-function StartNode($port) {
-  Start-Process $node -PassThru -WindowStyle Hidden -ArgumentList `
-    "--id",(IdOf $port),"--addr",":$port","--advertise","localhost:$port",`
-    "--peers",(PeersOf $port),"--data-dir",".\data\$(IdOf $port)","--snapshot-threshold","$Threshold",`
-    "--http",":$($port - 1000)"
-}
-function LeaderPort {
-  foreach ($p in $ports) {
-    try { if ((& $ctl -addr ":$p" status 2>$null) -match "role=leader") { return $p } } catch {}
-  }
-  return $null
-}
-function WaitLeader($timeoutMs=4000) {
-  $sw=[Diagnostics.Stopwatch]::StartNew()
-  while ($sw.ElapsedMilliseconds -lt $timeoutMs) { $l=LeaderPort; if ($l){return $l}; Start-Sleep -Milliseconds 150 }
-  return $null
-}
-
-# Kill stale raftnode processes from a prior run before claiming the ports.
-Get-Process raftnode -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 400
-
-if (Test-Path data) { Remove-Item -Recurse -Force data }
-Write-Host "== launching $N-node cluster ==" -ForegroundColor Cyan
-$procs = @{}
-foreach ($p in $ports) { $procs[$p] = StartNode $p }
-$leader = WaitLeader
-if (-not $leader) { throw "no leader formed" }
-Write-Host "leader elected: :$leader"
-
-# canary data
-$canary = @{}
-for ($i=0; $i -lt 30; $i++) { $k="canary$i"; $v="v$i"; & $ctl -addr ":$leader" set $k $v | Out-Null; $canary[$k]=$v }
-Write-Host "wrote $($canary.Count) canary keys"
-
-$rng = [Random]::new()
+$expected = [ordered]@{} # every acknowledged write: key -> value
 $failures = 0
-for ($r=1; $r -le $Rounds; $r++) {
-  $victim = $ports[$rng.Next($ports.Count)]
-  Write-Host "`n-- round $r/$Rounds : killing :$victim ($(IdOf $victim)) --" -ForegroundColor Yellow
-  try { Stop-Process -Id $procs[$victim].Id -Force -ErrorAction Stop } catch {}
-  Start-Sleep -Milliseconds 800
 
-  $leader = WaitLeader
-  if (-not $leader) { Write-Host "  FAIL: cluster lost quorum" -ForegroundColor Red; $failures++; }
-  else {
-    Write-Host "  recovered, leader=:$leader"
-    # Write a new key during the degraded state. Only track it as canary data
-    # once ctl actually confirms the commit (exit 0); a write that can't reach a
-    # stable leader within its hop budget must NOT be asserted later, or we'd be
-    # checking data the cluster never acknowledged. Retry across the settling window.
-    $dk="degraded$r"; $committed=$false
-    for ($try=0; $try -lt 5 -and -not $committed; $try++) {
-      $leader = WaitLeader
-      if (-not $leader) { Start-Sleep -Milliseconds 300; continue }
-      & $ctl -addr ":$leader" set $dk "ok" | Out-Null
-      if ($LASTEXITCODE -eq 0) { $committed=$true; $canary[$dk]="ok" }
-      else { Start-Sleep -Milliseconds 300 }
-    }
-    if (-not $committed) { Write-Host "  WARN: degraded write $dk never confirmed (cluster unstable); not tracking" -ForegroundColor DarkYellow }
+# Test-Expected reads back every acknowledged key from the leader and returns
+# a description of each one that is missing or wrong.
+function Test-Expected {
+  $bad = New-Object System.Collections.Generic.List[string]
+  foreach ($k in @($expected.Keys)) {
+    $r = Get-Key $k 10
+    if ($null -eq $r) { $bad.Add("no leader answered a read for $k"); break }
+    if (-not $r.found) { $bad.Add("$k is missing") }
+    elseif ($r.value -cne $expected[$k]) { $bad.Add("$k=$($r.value), want $($expected[$k])") }
   }
-
-  # restart victim from its data dir
-  $procs[$victim] = StartNode $victim
-  Start-Sleep -Milliseconds 1500
-
-  # integrity check: sample canary keys via the leader (linearizable reads)
-  $leader = WaitLeader
-  $bad = 0
-  foreach ($k in ($canary.Keys | Get-Random -Count ([Math]::Min(8,$canary.Count)))) {
-    $got = (& $ctl -addr ":$leader" get $k 2>$null)
-    if ($got -ne $canary[$k]) { $bad++; Write-Host "  MISMATCH $k=$got want $($canary[$k])" -ForegroundColor Red }
-  }
-  if ($bad -eq 0) { Write-Host "  integrity OK ($($canary.Count) keys tracked)" -ForegroundColor Green } else { $failures++ }
+  , $bad
 }
 
-Write-Host "`n== cleanup ==" -ForegroundColor Cyan
-foreach ($p in $procs.Values) { try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch {} }
-if ($failures -eq 0) { Write-Host "CHAOS PASSED: $Rounds rounds, zero data loss" -ForegroundColor Green; exit 0 }
-else { Write-Host "CHAOS FAILED: $failures problem round(s)" -ForegroundColor Red; exit 1 }
+try {
+  Reset-Cluster
+  Write-Host "== launching $N-node cluster (data in $DataRoot, seed $Seed) ==" -ForegroundColor Cyan
+  foreach ($p in $Cluster.Ports) { Start-Node $p }
+  $leader = Wait-Leader
+  if (-not $leader) { throw "no leader was elected" }
+  Write-Host "leader elected: $(NodeId $leader)"
+  for ($i = 0; $i -lt 30; $i++) {
+    if (-not (Set-Key "canary$i" "v$i")) { throw "canary write $i was never acknowledged" }
+    $expected["canary$i"] = "v$i"
+  }
+  Write-Host "wrote $($expected.Count) canary keys"
+
+  $rng = [Random]::new($Seed)
+  for ($r = 1; $r -le $Rounds; $r++) {
+    $problems = New-Object System.Collections.Generic.List[string]
+    $victim = $null
+    if ($KillLeader) {
+      $victim = Wait-Leader
+      if (-not $victim) { $problems.Add("no leader to kill") }
+    }
+    $role = if ($victim) { "leader" } else { "random node" }
+    if (-not $victim) { $victim = $Cluster.Ports[$rng.Next($N)] }
+    Write-Host "`nROUND $r KILL $(NodeId $victim) ($role)" -ForegroundColor Yellow
+    Stop-Node $victim
+
+    # With one node down a majority remains, so the cluster must stay available.
+    if (-not (Wait-Leader)) { $problems.Add("no leader elected with $($N - 1) of $N nodes up") }
+    elseif (Set-Key "degraded$r" "ok") { $expected["degraded$r"] = "ok" }
+    else { $problems.Add("a write failed with $($N - 1) of $N nodes up") }
+
+    Start-Node $victim
+    if (-not (Wait-Until { $null -ne (Get-NodeStatus $victim) } 15)) {
+      $problems.Add("$(NodeId $victim) did not come back after restart (see $DataRoot\logs)")
+    }
+    foreach ($b in (Test-Expected)) { $problems.Add($b) }
+
+    if ($problems.Count -gt 0) {
+      $failures++
+      Write-Host "ROUND $r RESULT=FAIL $($problems -join '; ')" -ForegroundColor Red
+    } else {
+      Write-Host "ROUND $r RESULT=OK all $($expected.Count) acknowledged keys read back" -ForegroundColor Green
+    }
+  }
+
+  # Convergence: a final write commits in the leader's term, which carries every
+  # earlier entry to every node. Then all nodes must hold byte-identical data.
+  Write-Host "`n== convergence check ==" -ForegroundColor Cyan
+  $finalWritten = Set-Key "final" "ok"
+  if ($finalWritten) { $expected["final"] = "ok" }
+  $deadline = (Get-Date).AddSeconds(20)
+  do {
+    $statuses = @($Cluster.Ports | ForEach-Object { Get-NodeStatus $_ -Digest } | Where-Object { $_ })
+    $digests = @($statuses | ForEach-Object { $_.digest } | Select-Object -Unique)
+    $converged = $statuses.Count -eq $N -and $digests.Count -eq 1
+    if (-not $converged) { Start-Sleep -Milliseconds 300 }
+  } while (-not $converged -and (Get-Date) -lt $deadline)
+  $bad = Test-Expected
+  if (-not $finalWritten) { $bad.Add("the final write was never acknowledged") }
+  if ($converged -and $bad.Count -eq 0) {
+    Write-Host "CONVERGENCE RESULT=OK all $N nodes hold identical data ($($statuses[0].keys) keys), every acknowledged key present" -ForegroundColor Green
+  } else {
+    $failures++
+    $perNode = ($statuses | ForEach-Object { "$($_.nodeId): keys=$($_.keys) applied=$($_.lastApplied) digest=$($_.digest)" }) -join ", "
+    Write-Host "CONVERGENCE RESULT=FAIL $($statuses.Count)/$N nodes answering; $perNode; $($bad -join '; ')" -ForegroundColor Red
+  }
+} catch {
+  $failures++
+  Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+} finally {
+  Stop-Cluster
+}
+
+if ($failures -eq 0) {
+  Write-Host "`nCHAOS RESULT=PASS $Rounds rounds, $($expected.Count) acknowledged writes, none lost" -ForegroundColor Green
+  exit 0
+}
+Write-Host "`nCHAOS RESULT=FAIL $failures problem(s); node logs are in $DataRoot\logs" -ForegroundColor Red
+exit 1

@@ -7,3 +7,15 @@ data*/
 /stream*.txt
 *.exe
 benchmark/report.txt
+
+# AI assistant / editor tooling (local only, never committed)
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+graphify-out/
+.cursor/
+.cursorrules
+.aider*
+.windsurf/
+.github/copilot-instructions.md

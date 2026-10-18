@@ -2,9 +2,8 @@ syntax = "proto3";
 package raft;
 option go_package = "github.com/chrisli/raft-kv-store/proto;raftpb";
 
-// Client-facing key-value API. Feature 1 implements this against a single node
-// with an in-memory store (no Raft yet). Internal node-to-node RPCs
-// (RequestVote, AppendEntries, InstallSnapshot) are added in later features.
+// Client-facing key-value API. Writes go through the Raft leader; a node that
+// cannot serve a request returns the leader's address in leader_hint.
 service KV {
   rpc Get(GetRequest) returns (GetReply);
   rpc Set(SetRequest) returns (WriteReply);
@@ -16,7 +15,7 @@ message GetRequest { string key = 1; }
 message GetReply {
   string value = 1;
   bool found = 2;
-  string leader_hint = 3; // set when a non-leader cannot serve (later features)
+  string leader_hint = 3; // set when a non-leader cannot serve a leader-mode read
 }
 
 message SetRequest {
@@ -63,6 +62,9 @@ message RequestVoteArgs {
   string candidate_id = 2; // candidate's advertised (dialable) address
   uint64 last_log_index = 3;
   uint64 last_log_term = 4;
+  // A pre-vote asks "would you vote for me in this term?" without either side
+  // changing state, so a node that cannot win never inflates its term.
+  bool pre_vote = 5;
 }
 message RequestVoteReply {
   uint64 term = 1;
@@ -74,12 +76,15 @@ message AppendEntriesArgs {
   string leader_id = 2; // leader's advertised (dialable) address
   uint64 prev_log_index = 3;
   uint64 prev_log_term = 4;
-  repeated LogEntry entries = 5; // empty for heartbeat (Feature 2)
+  repeated LogEntry entries = 5; // empty for a heartbeat
   uint64 leader_commit = 6;
 }
 message AppendEntriesReply {
   uint64 term = 1;
   bool success = 2;
+  // Follower's last log index, so a leader whose prev entry was rejected can
+  // jump straight back instead of retrying one index at a time.
+  uint64 last_index = 3;
 }
 
 message StatusRequest {}
@@ -94,4 +99,7 @@ message StatusReply {
   int32 num_keys = 8;
   uint64 snapshot_index = 9;
   int32 log_len = 10;
+  // Hash of the state machine's contents. Equal digests mean equal data, which
+  // lets a test compare nodes without reading every key from each.
+  string state_digest = 11;
 }

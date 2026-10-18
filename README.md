@@ -1,231 +1,205 @@
 # raft-kv-store
 
-A key-value store that runs on several machines at once and keeps working when some of them
-fail. It implements the Raft consensus algorithm from scratch in Go.
+A replicated key-value store built on my own implementation of the Raft consensus algorithm,
+written in Go. Five nodes keep identical copies of the data. Any node can be killed, the leader
+included, and the cluster keeps serving reads and writes. No write it acknowledged is lost.
 
-Think of it as a hash map (`set foo = bar`, `get foo`) that you can spread across 5 servers.
-You can kill any server, including the one in charge, and the cluster keeps serving reads and
-writes without losing any data you were told it saved.
+On one laptop with five nodes, it does about 12,000 writes/s and 34,000 reads/s, with a median
+write latency around 1.3 ms. There is also a web dashboard where you can kill nodes and watch
+the cluster recover.
 
-```
-5-node cluster. ~8,000 writes/sec. ~61,000 reads/sec. Sub-10ms median latency.
-Zero loss of committed data when a leader is killed. (Measured locally, see Benchmarks.)
-```
+## How Raft works here
 
-## What is Raft, in plain terms
+One node is the leader and the rest are followers. Every write goes to the leader, which adds it
+to an ordered log and sends it to the followers. A write is committed once a majority of nodes
+(3 of 5) has it on disk. Only then does the client get an answer.
 
-Say you store your data on one server. If that server dies, your data is gone and your app is
-down. So you copy the data onto several servers. Now you have a new problem: when a write comes
-in, how do all the copies agree on what happened and in what order, even while servers are
-crashing and restarting? If they disagree, two clients can read two different answers, or a
-write you thought was saved can quietly disappear.
+If the leader stops sending heartbeats, a follower waits a random timeout and asks the others to
+vote for it. A node only votes for a candidate whose log is at least as complete as its own.
+Every committed write is on a majority, and any two majorities overlap, so a new leader always
+already has every committed write.
 
-Raft is a set of rules that makes a group of servers agree. The short version:
+Applying the log to the hash map is the easy part. Getting five machines to agree on the log
+while they crash and restart is what most of the code is for.
 
-1. **One server is the leader.** The others are followers. Only the leader accepts writes.
-2. **The leader writes things down in order.** Every write becomes a numbered entry in a log,
-   like a shared to-do list. The leader sends each new entry to the followers.
-3. **A write only counts once a majority has it.** With 5 servers, that means at least 3. Once
-   3 of them have written the entry down, it is "committed" and can never be undone. Only then
-   does the leader tell the client "done."
-4. **If the leader dies, the followers hold an election.** They wait a short random time, and
-   whoever speaks up first and has an up-to-date log becomes the new leader. The random wait is
-   what stops everyone from nominating themselves at the same instant.
-5. **The new leader is guaranteed to have every committed write.** This falls out of the math:
-   a committed write is on a majority, and you cannot win an election without a majority voting
-   for you, and any two majorities share at least one server. So the winner always already has
-   the committed data.
+## Features
 
-That is the whole idea. The actual key-value store is just "apply the committed log in order."
-Agreeing on the log is the hard part, and that is what Raft handles.
+- Leader election with randomized timeouts. Before a real election, a node holds a *pre-vote*:
+  it asks whether it would win, without changing any state. A node that was cut off from the
+  others therefore can't push the term up and depose a working leader when it reconnects. A
+  leader that loses contact with its majority steps down by itself (check-quorum).
+- Log replication with Raft's consistency check. Each follower gets at most one request in
+  flight, and writes that pile up meanwhile go out together in the next batch.
+- Two read modes, set per node:
+  - `--read-mode leader` (default): linearizable. Before answering, the leader confirms it is
+    still leader (read-index).
+  - `--read-mode follower`: any node answers from its own copy. Faster, but a read can lag the
+    latest write slightly.
+- Snapshots and log compaction. A follower that falls behind the leader's snapshot is sent the
+  snapshot instead of the old log.
+- Persistence: an append-only log plus snapshot files, so a restarted node comes back with its
+  data. The file formats survive a crash at any point of a write; the tests cover each case.
+- A dashboard for starting, killing and restarting nodes and for running the load and fault
+  tests from the browser.
 
-If you want the deep version (every rule, the edge cases, the bugs I hit), read `SPEC.md`.
-
-## What it does
-
-- **Leader election.** Randomized timeouts, terms, and `RequestVote`. One leader at a time, and
-  automatic re-election when a leader fails.
-- **Log replication.** The leader appends writes and copies them to followers with a consistency
-  check, commits once a majority agrees, and applies them to the store in order.
-- **Two read modes**, chosen per node:
-  - `--read-mode leader` (default): the leader answers reads, but only after checking it still
-    has majority support. Always returns the latest value (linearizable). Clients route to the
-    leader automatically.
-  - `--read-mode follower`: any node answers from its own copy. Much higher read throughput, but
-    a read can be slightly behind the latest write. (See Design notes.)
-- **Snapshots and log compaction.** The log cannot grow forever, so nodes periodically snapshot
-  the store and throw away the old log. A node that has fallen too far behind catches up by
-  receiving a snapshot.
-- **Durability.** State is written to disk (an append-only log plus snapshots), so a node
-  recovers its data after a restart.
-- **Fault tolerance.** Kill or restart any node. The cluster re-elects a leader and recovers
-  with no loss of committed writes.
-- **Dashboard.** A live web view of every node: its role, term, commit position, snapshot point,
-  and key count, plus a write box that routes to the leader.
-
-## How it is built
+## Layout
 
 ```
-proto/       gRPC service definitions and generated Go (the client KV API plus internal Raft RPCs)
-server/      the Raft core (no networking in it), the KV store, and the gRPC and HTTP servers
-client/      a CLI that automatically follows the leader
-benchmark/   a load generator that reports throughput and latency percentiles
-dashboard/   a static HTML/JS page that polls each node's HTTP endpoint
-scripts/     chaos.ps1 (fault injection) and bench.ps1 (benchmark runner)
-docker-compose.yml   a 5-node cluster plus the dashboard
+proto/       gRPC definitions (client API and Raft RPCs) and generated code
+server/      the node: Raft (raft.go, election.go, replication.go, readindex.go),
+             persistence, the KV store, gRPC and HTTP servers
+client/      raftctl, a CLI that follows leader redirects
+benchmark/   raftbench, a load generator
+control/     raftcontrol, the local server behind the dashboard
+dashboard/   the web UI (plain HTML/CSS/JS, no build step)
+scripts/     chaos.ps1 (fault test), bench.ps1 (benchmark), lib.ps1 (shared helpers)
+docs/        HARDENING.md and RELIABILITY.md: bugs found and how they were fixed
 ```
 
-The Raft core in `server/raft.go` does not know about sockets. It talks to other nodes through a
-`Transport` interface. Production uses a gRPC transport. The tests use an in-memory one that can
-drop messages to a chosen node, which is how partitions and crashes are tested in-process without
-any real network.
+The Raft code never touches a socket. It sends messages through a `Transport` interface. In
+production that is gRPC. The tests use an in-memory network that can partition nodes, crash and
+restart them, and drop or delay messages.
 
-Each node speaks two protocols: gRPC for node-to-node Raft messages and the client API, and an
-optional HTTP/JSON endpoint for the browser dashboard (the HTTP port is the gRPC port minus 1000).
+Each node serves gRPC (Raft traffic and the client API) and, optionally, a small HTTP API for the
+dashboard and scripts, on the gRPC port minus 1000:
 
-## Quick start (local, no Docker)
+| Endpoint | Method | |
+|---|---|---|
+| `/status` | GET | role, term, commit index, key count (`?digest=1` adds a hash of the data) |
+| `/get?key=K` | GET | read a key |
+| `/set?key=K&value=V` | POST | write a key |
+| `/del?key=K` | POST | delete a key |
 
-Needs Go 1.26 or newer. `protoc` is only needed if you regenerate the protobufs.
+Writes must be POSTs, and browser requests are only accepted from pages served on the same
+machine.
 
-```bash
-# build
-go build -o bin/raftnode ./server
-go build -o bin/raftctl  ./client
+## Running it
 
-# start 3 nodes
-./bin/raftnode --id n1 --addr :9001 --advertise localhost:9001 --peers localhost:9002,localhost:9003 --data-dir ./data/n1
-./bin/raftnode --id n2 --addr :9002 --advertise localhost:9002 --peers localhost:9001,localhost:9003 --data-dir ./data/n2
-./bin/raftnode --id n3 --addr :9003 --advertise localhost:9003 --peers localhost:9001,localhost:9002 --data-dir ./data/n3
-
-# use it (writes go to the leader automatically)
-./bin/raftctl -addr :9001 set foo bar
-./bin/raftctl -addr :9001 get foo        # -> bar
-./bin/raftctl -addr :9001 status
-```
-
-## Cluster plus dashboard (Docker)
-
-```bash
-docker compose up --build
-# open http://localhost:8080
-```
-
-Five nodes (gRPC `:9001-9005`, HTTP `:8001-8005`) plus the dashboard on `:8080`. Stop a container
-(`docker compose stop node3`) and watch the dashboard re-elect and recover in real time.
-
-## Fault injection
-
-```powershell
-pwsh scripts/chaos.ps1 -Rounds 10
-```
-
-Starts a 5-node cluster, writes some canary data, then repeatedly kills and restarts random
-nodes. After every round it checks that the data is still readable and a leader has re-formed. It
-exits with an error if any committed data was lost.
-
-## Benchmarks
-
-```powershell
-pwsh scripts/bench.ps1 -Writers 24 -Readers 16 -Duration 5s   # -> benchmark/report.txt
-```
-
-Measured on a 5-node cluster with persistence on, single dev machine, follower reads.
-Numbers vary by run and machine load, so these are ranges across several runs:
-
-| Metric | Result |
-|--------|--------|
-| Writes | ~8,000 to 10,000 ops/sec, p50 ~2 ms, p99 ~18 ms |
-| Reads  | ~60,000 to 93,000 ops/sec, p50 under 1 ms |
-| Leader-kill recovery | re-elects and resumes writes within about 1 second |
-
-Writes are limited by the round trip to a majority plus writing to disk. Reads scale with the
-number of nodes in follower mode.
-
-These numbers depend heavily on the machine, because all five nodes run on one box over loopback
-and share its CPU and SSD. Measured on:
-
-- AMD Ryzen 7 260 (8 cores / 16 threads, 3.8 GHz base)
-- 16 GB DDR5-5600
-- 512 GB SK Hynix NVMe SSD
-
-The core count sets the ceiling, since the five nodes and the load generator all compete for cores,
-and reads in particular are CPU-bound on gRPC and JSON work. The NVMe SSD keeps write latency low
-because every committed write appends to an on-disk log. Expect lower throughput on fewer cores or a
-slower disk. On separate physical machines, network round-trips would dominate write latency instead
-of the local CPU and disk.
-
-## Control dashboard (benchmark and chaos in the browser)
-
-A small Go server (`control/main.go`) runs the benchmark and chaos harnesses from a web UI
-instead of the terminal. It launches the PowerShell harnesses as child processes and streams
-their output to the page over Server-Sent Events, since a browser cannot spawn a process or
-speak gRPC on its own. The page shows live throughput and latency, a pass/fail strip for chaos
-rounds, a node grid that updates while the cluster runs, and the raw log.
+Requires Go 1.26+. You only need `protoc` if you change `proto/raft.proto`.
 
 ```powershell
 go build -o bin/raftnode.exe    ./server
 go build -o bin/raftctl.exe     ./client
 go build -o bin/raftbench.exe   ./benchmark
 go build -o bin/raftcontrol.exe ./control
-./bin/raftcontrol.exe   # serves http://localhost:8090
 ```
 
-Open `http://localhost:8090`, set the parameters (writers, readers, duration, snapshot
-threshold, or chaos rounds), and run. One run executes at a time, and Stop kills it and clears
-any leftover nodes. A low chaos snapshot threshold (say 25) forces aggressive log compaction,
-which is the path that stresses snapshot and restore the most.
+### Dashboard
 
-A run usually reports a small number of write/read errors, about one per worker thread
-(for example 24 errors with 24 writers). That is expected and benign: each worker's first
-request can land before it has routed to the current leader, so it fails once, re-routes via
-the leader hint, and then succeeds for the rest of the run. It is the client correctly
-finding the leader, not lost or corrupted data.
+```powershell
+./bin/raftcontrol.exe        # then open http://127.0.0.1:8090
+```
 
-## Design notes
+Press **Start cluster** to launch five nodes. Things to try:
 
-- **Reads: leader vs any node.** Leader reads always return the latest value but go through one
-  node and need a leadership check first. Follower reads spread across all nodes and go faster,
-  but can return a value that is a little stale. Both are built in and selectable per node.
-- **Why committed data is safe.** A new leader commits a no-op entry at the start of its term, so
-  entries from earlier terms commit along with it (Raft section 5.4.2). An entry counts as
-  committed only once it is on a majority and from the current term, which prevents a committed
-  entry from being lost after a leader change.
-- **How durable it is.** State is an append-only log plus snapshots. By default writes reach the
-  operating system (so they survive a process crash, which is what the chaos test exercises) but
-  are not flushed to the physical disk on every write, so a sudden power loss can still lose
-  recently acknowledged writes. Start a node with `--fsync` to flush every durable write through
-  to the disk before acknowledging it, which closes that gap at a real cost in write latency:
+1. **Write 100 random keys**: every node's log bar grows, then gets folded into a snapshot.
+2. **Kill** the leader. The banner turns to Degraded, and within about a second another node
+   takes over. Writes keep working.
+3. **Start** the killed node again. It reloads its data from disk and catches up.
+4. **Read from** a specific node to check that each copy has the key.
 
-  | mode | writes/sec | p50 | p95 | p99 |
-  |------|-----------|-----|-----|-----|
-  | default (page cache) | ~7,300 | 2.47 ms | 6.4 ms | 24.4 ms |
-  | `--fsync` | ~1,000 | 21.9 ms | 35.2 ms | 52.0 ms |
+Kill is a real process kill, the same as a crash. The two test panels at the bottom run the
+fault test and the benchmark described below and show their results. A test run starts its own
+cluster on the same ports, so the demo cluster is stopped while it runs.
 
-  About 7x the throughput for power-loss safety. Reads are unaffected (~31,000/sec either way)
-  since they never touch the disk. Reproduce with `pwsh scripts/bench.ps1 -Fsync`.
-- **Why this beats a naive disk format.** The first version rewrote the entire state on every
-  write, which was quadratic and ran at about 98 writes/sec. Switching to an append-only log
-  brought it to about 7,900 writes/sec.
+The control server listens only on 127.0.0.1, accepts changes only as POSTs from pages on this
+machine, and keeps node data in `%TEMP%\raft-kv-store\demo`. Don't keep node data in OneDrive or
+Dropbox: sync clients briefly lock files while a node replaces them.
 
-## Common questions
+### By hand
 
-- **Why Raft and not Paxos?** Raft was designed to be understandable. It has an explicit leader
-  and splits the problem into election, replication, and safety, which makes it much easier to
-  build correctly and to reason about.
-- **What about a network split (two halves that cannot talk)?** A leader needs a majority to
-  commit. The smaller half cannot elect a leader or commit anything, and the old leader stranded
-  there cannot commit either, so you never get two leaders both accepting writes. The leadership
-  check also stops a stranded leader from answering reads with stale data.
-- **What if the leader crashes mid-write?** A write that had not committed yet may be dropped, and
-  the client retries. A write that had committed survives, because it is on a majority and the
-  next leader is guaranteed to have it. The zero-data-loss fault test confirms this.
+```powershell
+./bin/raftnode --id n1 --addr :9001 --advertise localhost:9001 --peers localhost:9002,localhost:9003 --data-dir data/n1 --http :8001
+./bin/raftnode --id n2 --addr :9002 --advertise localhost:9002 --peers localhost:9001,localhost:9003 --data-dir data/n2 --http :8002
+./bin/raftnode --id n3 --addr :9003 --advertise localhost:9003 --peers localhost:9001,localhost:9002 --data-dir data/n3 --http :8003
 
-## Testing
+./bin/raftctl -addr :9001 set foo bar     # sent on to the leader if :9001 isn't it
+./bin/raftctl -addr :9001 get foo
+./bin/raftctl -addr :9001 status
+```
+
+### Docker
 
 ```bash
-go test ./...      # election, replication, snapshot and InstallSnapshot, persistence, fault
+docker compose up --build    # five nodes, dashboard on http://localhost:8080
 ```
 
-Consensus is tested over the in-memory transport (partitions, crashes, restarts) plus gRPC
-service tests over `bufconn`. (The race detector needs cgo and a C compiler, so the tests
-otherwise run without it.)
+`docker compose stop node3` takes a node down. Under Docker the page shows the cluster and has
+the read/write box, but the kill buttons and test panels need `raftcontrol`.
+
+## Fault test
+
+```powershell
+powershell -File scripts\chaos.ps1 -Rounds 10 [-KillLeader] [-Seed N]
+```
+
+The script starts five nodes and writes 30 keys. Each round:
+
+1. It kills one node: a random one, or the current leader with `-KillLeader`.
+2. It checks that the survivors elect a leader and accept a new write.
+3. It restarts the node it killed.
+4. It reads back every write the cluster acknowledged.
+
+At the end, every node must report the same data hash. Each round prints one result line
+(`ROUND 3 RESULT=OK ...`). A failed round says what went wrong, and node logs are kept in
+`%TEMP%\raft-kv-store\chaos\logs`. The seed is printed at the start, so a failing run can be
+replayed with the same sequence of kills.
+
+## Benchmark
+
+```powershell
+powershell -File scripts\bench.ps1 -Writers 24 -Readers 16 -Duration 5s
+```
+
+Results go to `benchmark/report.txt`. Five runs on a 5-node cluster with persistence and
+follower reads:
+
+| | Throughput | p50 | p99 | Errors |
+|---|---|---|---|---|
+| Writes | 12,075 – 12,819 ops/s | 1.25 ms | ~19 ms | 0 |
+| Reads | 32,943 – 35,000 ops/s | 0.55 ms | ~1.6 ms | 0 |
+
+After the leader is killed, writes resume within about a second.
+
+Machine: AMD Ryzen 7 260 (8 cores/16 threads), 16 GB DDR5-5600, NVMe SSD. All five nodes and the
+load generator share it, so the CPU sets the ceiling. On separate machines, network round trips
+would dominate write latency instead.
+
+Any failed operation is listed with its reason, and the benchmark then exits non-zero.
+
+## Durability tradeoff
+
+By default a write is acknowledged once it has reached the operating system. That survives a
+process crash, which is what the fault test exercises. It does not survive a sudden power loss.
+`--fsync` makes every node flush to disk before acknowledging, at a large cost in write
+throughput (about 7x in an earlier measurement). Measure it on your machine with
+`powershell -File scripts\bench.ps1 -Fsync`.
+
+An early version rewrote the whole state file on every write and managed about 98 writes/s.
+Switching to an append-only log is what made the current numbers possible.
+
+## Tests
+
+```powershell
+go test ./...                                          # about 25 s
+$env:RAFT_FUZZ_SEEDS=30; go test ./server -run Fuzz    # more randomized fault runs
+```
+
+- **Cluster tests.** Real nodes run over the in-memory network. They check:
+  - elections, including one- and two-node clusters;
+  - that a minority partition can't elect a leader or commit;
+  - that divergent logs are repaired to match the leader's;
+  - that an old-term entry isn't committed just by counting copies (figure 8 of the Raft paper);
+  - pre-vote, check-quorum, read-index, snapshots, and recovery from disk.
+- **Randomized fault test.** Three clients write while the network partitions and heals,
+  nodes crash and restart, and 5% of messages are dropped. Two things are checked
+  continuously: no term ever has two leaders, and every node applies the same entry at each
+  index. At the end, every acknowledged write must be on all five nodes.
+- **Storage tests.** These cover:
+  - a crash between the files a compaction rewrites;
+  - torn and partial log writes, and corrupt metadata;
+  - a disk error at each point where Raft writes.
+
+Each safety fix was checked by putting the bug back and confirming that a test fails.
+`docs/RELIABILITY.md` lists them. The Go race detector needs a 64-bit C compiler for cgo, which this machine doesn't have,
+so it isn't part of the runs above.

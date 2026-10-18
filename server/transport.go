@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"sync"
+	"time"
 
 	raftpb "github.com/chrisli/raft-kv-store/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
@@ -25,7 +27,22 @@ func (t *grpcTransport) client(peer string) (raftpb.RaftClient, error) {
 	if c, ok := t.conns[peer]; ok {
 		return c, nil
 	}
-	conn, err := grpc.NewClient(peer, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// Peers restart often (that is the point of the demo). gRPC's default
+	// reconnect backoff grows toward two minutes, so a leader would keep failing to
+	// reach a node that has been back for seconds, and that node, hearing no
+	// heartbeats, would start elections. Retry quickly instead.
+	conn, err := grpc.NewClient(peer,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithConnectParams(grpc.ConnectParams{
+			Backoff: backoff.Config{
+				BaseDelay:  50 * time.Millisecond,
+				Multiplier: 1.5,
+				Jitter:     0.2,
+				MaxDelay:   500 * time.Millisecond,
+			},
+			MinConnectTimeout: 300 * time.Millisecond,
+		}),
+	)
 	if err != nil {
 		return nil, err
 	}

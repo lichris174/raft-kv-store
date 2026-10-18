@@ -4,15 +4,20 @@
 //	benchmark -addrs localhost:9001,localhost:9002,... -writers 16 -readers 16 -duration 5s
 //
 // Writers route to the leader (following NOT_LEADER hints). Readers spread
-// round-robin across all nodes; run the cluster with -read-mode follower for
+// randomly across all nodes; run the cluster with -read-mode follower for
 // scalable local reads, or leave it leader-only to measure linearizable reads.
+// Every failed operation is tallied by reason, so a non-zero error count always
+// says what went wrong. The exit code is 1 if nothing could be measured or any
+// operation failed, so scripts can tell a clean run from a broken one.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"math/rand"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -23,6 +28,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+const rpcTimeout = 2 * time.Second
 
 func main() {
 	addrsCSV := flag.String("addrs", "localhost:9001", "comma-separated node addresses")
@@ -35,162 +42,189 @@ func main() {
 	addrs := splitCSV(*addrsCSV)
 	if len(addrs) == 0 {
 		fmt.Println("need -addrs")
-		return
+		os.Exit(1)
 	}
-
-	cs := dialAll(addrs)
-	defer cs.close()
-
 	fmt.Printf("cluster: %v\nwriters=%d readers=%d duration=%s keyspace=%d\n\n",
 		addrs, *writers, *readers, *duration, *keyspace)
 
+	cs := dialAll(addrs)
 	leader := resolveLeader(cs.clients)
+	cs.close()
 	if leader == "" {
 		fmt.Println("no leader found, is the cluster up?")
-		return
+		os.Exit(1)
 	}
 	fmt.Printf("leader: %s\n\n", leader)
+	leaderAddr.Store(leader)
 
-	wr := runPhase("WRITE", *writers, *duration, addrs, leader, func(ctx context.Context, rng *rand.Rand, conns map[string]raftpb.KVClient) (time.Duration, bool) {
-		key := fmt.Sprintf("k%d", rng.Intn(*keyspace))
-		return writeOnce(ctx, conns, addrs, key, "value")
+	randomKey := func(rng *rand.Rand) string { return fmt.Sprintf("k%d", rng.Intn(*keyspace)) }
+	wr := runPhase("WRITE", *writers, *duration, addrs, func(rng *rand.Rand, conns map[string]raftpb.KVClient) error {
+		return writeOnce(conns, addrs, randomKey(rng), "value")
 	})
-
-	rd := runPhase("READ", *readers, *duration, addrs, leader, func(ctx context.Context, rng *rand.Rand, conns map[string]raftpb.KVClient) (time.Duration, bool) {
-		key := fmt.Sprintf("k%d", rng.Intn(*keyspace))
-		addr := addrs[rng.Intn(len(addrs))]
-		return readOnce(ctx, conns, addr, key)
+	rd := runPhase("READ", *readers, *duration, addrs, func(rng *rand.Rand, conns map[string]raftpb.KVClient) error {
+		return readOnce(conns[addrs[rng.Intn(len(addrs))]], randomKey(rng))
 	})
 
 	fmt.Println(strings.Repeat("=", 56))
 	wr.print()
 	rd.print()
+	if wr.errors()+rd.errors() > 0 || len(wr.lats) == 0 || len(rd.lats) == 0 {
+		os.Exit(1) // any failure, or a phase that completed nothing
+	}
 }
 
 // leaderAddr is shared across writers; updated when a NOT_LEADER hint arrives.
 var leaderAddr atomic.Value // string
 
-func writeOnce(ctx context.Context, conns map[string]raftpb.KVClient, addrs []string, key, val string) (time.Duration, bool) {
+// writeOnce sets key, following NOT_LEADER hints and retrying transient RPC
+// errors (e.g. a brief UNAVAILABLE during a leader change) a few times.
+func writeOnce(conns map[string]raftpb.KVClient, addrs []string, key, val string) error {
 	addr, _ := leaderAddr.Load().(string)
-	if addr == "" {
-		addr = addrs[0]
-	}
-	start := time.Now()
-	// A few attempts: follow NOT_LEADER hints and retry transient RPC errors
-	// (e.g. a brief UNAVAILABLE during a leader change) before counting a failure.
+	var err error
 	for attempt := 0; attempt < 5; attempt++ {
 		cli := conns[addr]
 		if cli == nil {
 			addr = addrs[0]
-			continue
+			if cli = conns[addr]; cli == nil {
+				return fmt.Errorf("no connection to %s", addr)
+			}
 		}
-		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		r, err := cli.Set(cctx, &raftpb.SetRequest{Key: key, Value: val})
+		cctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		r, rpcErr := cli.Set(cctx, &raftpb.SetRequest{Key: key, Value: val})
 		cancel()
-		if err != nil {
-			continue // transient: retry
+		switch {
+		case rpcErr != nil:
+			err = rpcErr
+		case r.GetOk():
+			return nil
+		case r.GetLeaderHint() != "" && conns[r.GetLeaderHint()] != nil:
+			addr = r.GetLeaderHint()
+			leaderAddr.Store(addr)
+			err = errors.New("not leader")
+		default:
+			return errors.New(r.GetError())
 		}
-		if r.GetOk() {
-			return time.Since(start), true
-		}
-		if h := r.GetLeaderHint(); h != "" && conns[h] != nil {
-			leaderAddr.Store(h)
-			addr = h
-			continue
-		}
-		return 0, false
 	}
-	return 0, false
+	return err
 }
 
-func readOnce(ctx context.Context, conns map[string]raftpb.KVClient, addr, key string) (time.Duration, bool) {
-	cli := conns[addr]
+// readOnce gets key from one node, retrying a transient RPC error. A not-found
+// result is a successful read. A redirect is not: it means the cluster runs in
+// leader read mode, where this benchmark's spread-out reads do not apply.
+func readOnce(cli raftpb.KVClient, key string) error {
 	if cli == nil {
-		return 0, false
+		return errors.New("no connection")
 	}
-	start := time.Now()
-	// Retry a transient RPC error a couple of times before counting a failure; a
-	// not-found result or a leader-mode redirect is still a successful round-trip.
+	var err error
 	for try := 0; try < 3; try++ {
-		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		_, err := cli.Get(cctx, &raftpb.GetRequest{Key: key})
+		cctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		var r *raftpb.GetReply
+		r, err = cli.Get(cctx, &raftpb.GetRequest{Key: key})
 		cancel()
+		if err == nil && r.GetLeaderHint() != "" {
+			return errors.New("redirected to the leader (cluster is in leader read mode; use -read-mode follower)")
+		}
 		if err == nil {
-			return time.Since(start), true
+			return nil
 		}
 	}
-	return 0, false
+	return err
 }
 
 type result struct {
 	name    string
-	ops     int64
 	dur     time.Duration
-	lats    []time.Duration
-	errored int64
+	lats    []time.Duration // one per successful operation
+	reasons map[string]int  // failure reason -> count
 }
 
-func runPhase(name string, workers int, dur time.Duration, addrs []string, leader string,
-	op func(context.Context, *rand.Rand, map[string]raftpb.KVClient) (time.Duration, bool)) result {
+// worker is one load generator's private tally, merged after the phase ends.
+type worker struct {
+	lats    []time.Duration
+	reasons map[string]int
+}
 
-	leaderAddr.Store(leader)
-	ctx, cancel := context.WithTimeout(context.Background(), dur)
-	defer cancel()
+func runPhase(name string, workers int, dur time.Duration, addrs []string,
+	op func(*rand.Rand, map[string]raftpb.KVClient) error) result {
 
+	// Workers stop starting new requests at the deadline, but a request already in
+	// flight runs to completion on its own timeout. Cancelling it instead would make
+	// the benchmark's own shutdown show up as errors (it used to add about one per
+	// worker to every run). Only successes inside the phase count toward
+	// throughput, which is over the phase length, so a straggler cannot skew it;
+	// every failure counts, whenever it surfaces.
+	deadline := time.Now().Add(dur)
+	tallies := make([]worker, workers)
 	var wg sync.WaitGroup
-	latCh := make(chan []time.Duration, workers)
-	var ops, errs int64
-
-	start := time.Now()
-	for w := 0; w < workers; w++ {
+	for i := range tallies {
 		wg.Add(1)
-		go func(seed int64) {
+		go func(w *worker, seed int64) {
 			defer wg.Done()
 			cs := dialAll(addrs) // each worker owns its connections (no shared-socket contention)
 			defer cs.close()
 			rng := rand.New(rand.NewSource(seed))
-			local := make([]time.Duration, 0, 4096)
-			for {
-				select {
-				case <-ctx.Done():
-					latCh <- local
-					return
-				default:
-				}
-				lat, ok := op(ctx, rng, cs.clients)
-				if ok {
-					atomic.AddInt64(&ops, 1)
-					local = append(local, lat)
-				} else {
-					atomic.AddInt64(&errs, 1)
+			w.reasons = map[string]int{}
+			for time.Now().Before(deadline) {
+				t0 := time.Now()
+				err := op(rng, cs.clients)
+				switch {
+				case err != nil: // a real failure even if it surfaced after the deadline
+					w.reasons[reason(err)]++
+				case time.Now().Before(deadline):
+					w.lats = append(w.lats, time.Since(t0))
 				}
 			}
-		}(int64(w)*7919 + time.Now().UnixNano())
+		}(&tallies[i], int64(i)*7919+time.Now().UnixNano())
 	}
 	wg.Wait()
-	elapsed := time.Since(start)
-	close(latCh)
 
-	all := make([]time.Duration, 0, ops)
-	for l := range latCh {
-		all = append(all, l...)
+	res := result{name: name, dur: dur, reasons: map[string]int{}}
+	for _, w := range tallies {
+		res.lats = append(res.lats, w.lats...)
+		for k, v := range w.reasons {
+			res.reasons[k] += v
+		}
 	}
-	return result{name: name, ops: ops, dur: elapsed, lats: all, errored: errs}
+	return res
 }
 
+// reason condenses an error to a short, groupable label.
+func reason(err error) string {
+	s := err.Error()
+	if i := strings.Index(s, "desc = "); i >= 0 { // gRPC status: keep the description
+		s = s[i+len("desc = "):]
+	}
+	if len(s) > 60 {
+		s = s[:60] + "..."
+	}
+	return s
+}
+
+func (r result) errors() int {
+	n := 0
+	for _, c := range r.reasons {
+		n += c
+	}
+	return n
+}
+
+// print writes the phase summary. dashboard/tests.js parses these lines.
 func (r result) print() {
-	tput := float64(r.ops) / r.dur.Seconds()
-	fmt.Printf("%-6s  ops=%-8d  %.0f ops/s  errors=%d\n", r.name, r.ops, tput, r.errored)
-	if len(r.lats) == 0 {
+	ops := len(r.lats)
+	fmt.Printf("%-6s  ops=%-8d  %.0f ops/s  errors=%d\n", r.name, ops, float64(ops)/r.dur.Seconds(), r.errors())
+	for msg, n := range r.reasons {
+		fmt.Printf("        error x%d: %s\n", n, msg)
+	}
+	if ops == 0 {
+		fmt.Println()
 		return
 	}
 	sort.Slice(r.lats, func(i, j int) bool { return r.lats[i] < r.lats[j] })
-	p := func(q float64) time.Duration { return r.lats[int(float64(len(r.lats)-1)*q)] }
-	fmt.Printf("        latency  p50=%s  p95=%s  p99=%s  max=%s\n\n",
-		round(p(0.50)), round(p(0.95)), round(p(0.99)), round(r.lats[len(r.lats)-1]))
+	// Plain "ms" rather than Duration's "µs": the micro sign is mangled by the
+	// Windows console code page on its way to the report and the dashboard.
+	p := func(q float64) string { return fmt.Sprintf("%.2fms", float64(r.lats[int(float64(ops-1)*q)])/1e6) }
+	fmt.Printf("        latency  p50=%s  p95=%s  p99=%s  max=%s\n\n", p(0.50), p(0.95), p(0.99), p(1))
 }
-
-func round(d time.Duration) time.Duration { return d.Round(10 * time.Microsecond) }
 
 // --- helpers ---
 
@@ -232,19 +266,18 @@ func (cs *connSet) close() {
 	}
 }
 
+// resolveLeader asks each node for status and returns the leader's address
+// (every node, the leader included, reports it as LeaderId).
 func resolveLeader(conns map[string]raftpb.KVClient) string {
-	for addr, cli := range conns {
+	for _, cli := range conns {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		r, err := cli.Status(ctx, &raftpb.StatusRequest{})
 		cancel()
-		if err == nil && r.GetRole() == "leader" {
-			if r.GetLeaderId() != "" {
-				return r.GetLeaderId()
-			}
-			return addr
+		if err != nil {
+			continue
 		}
-		if err == nil && r.GetLeaderId() != "" {
-			return r.GetLeaderId()
+		if id := r.GetLeaderId(); id != "" {
+			return id
 		}
 	}
 	return ""

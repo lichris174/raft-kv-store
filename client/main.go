@@ -35,10 +35,14 @@ func main() {
 		runGet(*addr, args[1])
 	case "set":
 		need(args, 3)
-		runWrite(*addr, "set", args[1], args[2])
+		runWrite(*addr, func(c context.Context, cli raftpb.KVClient) (*raftpb.WriteReply, error) {
+			return cli.Set(c, &raftpb.SetRequest{Key: args[1], Value: args[2]})
+		})
 	case "del", "delete":
 		need(args, 2)
-		runWrite(*addr, "del", args[1], "")
+		runWrite(*addr, func(c context.Context, cli raftpb.KVClient) (*raftpb.WriteReply, error) {
+			return cli.Delete(c, &raftpb.DeleteRequest{Key: args[1]})
+		})
 	case "status":
 		runStatus(*addr)
 	default:
@@ -46,88 +50,76 @@ func main() {
 	}
 }
 
-func dial(addr string) (*grpc.ClientConn, raftpb.KVClient) {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		fail("connect %s: %v", addr, err)
-	}
-	return conn, raftpb.NewKVClient(conn)
-}
-
-func ctx() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), 5*time.Second)
-}
-
-// runWrite follows WriteReply.LeaderHint until the op lands or hops run out.
-func runWrite(addr, op, key, value string) {
+// followLeader calls the node at addr and, while the reply carries a leader
+// hint pointing elsewhere, calls that node instead. call returns the hint from
+// its reply ("" when the node served the request). It exits on an RPC error.
+func followLeader(addr string, call func(context.Context, raftpb.KVClient) (hint string, err error)) {
 	for hop := 0; hop < maxHops; hop++ {
-		conn, cli := dial(addr)
-		c, cancel := ctx()
-		var r *raftpb.WriteReply
-		var err error
-		if op == "set" {
-			r, err = cli.Set(c, &raftpb.SetRequest{Key: key, Value: value})
-		} else {
-			r, err = cli.Delete(c, &raftpb.DeleteRequest{Key: key})
+		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			fail("connect %s: %v", addr, err)
 		}
+		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		hint, err := call(c, raftpb.NewKVClient(conn))
 		cancel()
 		conn.Close()
 		if err != nil {
 			fail("rpc error: %v", err)
+		}
+		if hint == "" {
+			return
+		}
+		if hint == addr {
+			fail("FAILED: %s names itself as leader but did not serve the request", addr)
+		}
+		addr = hint
+	}
+	fail("giving up after %d hops (no stable leader)", maxHops)
+}
+
+func runWrite(addr string, write func(context.Context, raftpb.KVClient) (*raftpb.WriteReply, error)) {
+	followLeader(addr, func(c context.Context, cli raftpb.KVClient) (string, error) {
+		r, err := write(c, cli)
+		if err != nil {
+			return "", err
 		}
 		if r.GetOk() {
 			fmt.Println("OK")
-			return
+			return "", nil
 		}
-		if hint := r.GetLeaderHint(); hint != "" && hint != addr {
-			addr = hint
-			continue
+		if r.GetLeaderHint() == "" {
+			fail("FAILED: %s", r.GetError())
 		}
-		fail("FAILED: %s", r.GetError())
-	}
-	fail("giving up after %d hops (no stable leader)", maxHops)
+		return r.GetLeaderHint(), nil
+	})
 }
 
-// runGet follows GetReply.LeaderHint (set when a non-leader can't serve a
-// linearizable read) until a node answers.
 func runGet(addr, key string) {
-	for hop := 0; hop < maxHops; hop++ {
-		conn, cli := dial(addr)
-		c, cancel := ctx()
+	followLeader(addr, func(c context.Context, cli raftpb.KVClient) (string, error) {
 		r, err := cli.Get(c, &raftpb.GetRequest{Key: key})
-		cancel()
-		conn.Close()
-		if err != nil {
-			fail("rpc error: %v", err)
+		if err != nil || r.GetLeaderHint() != "" {
+			return r.GetLeaderHint(), err
 		}
-		if hint := r.GetLeaderHint(); hint != "" && hint != addr {
-			addr = hint
-			continue
-		}
-		if r.GetFound() {
-			fmt.Println(r.GetValue())
-		} else {
+		if !r.GetFound() {
 			fmt.Println("(not found)")
 			os.Exit(1)
 		}
-		return
-	}
-	fail("giving up after %d hops (no stable leader)", maxHops)
+		fmt.Println(r.GetValue())
+		return "", nil
+	})
 }
 
 func runStatus(addr string) {
-	conn, cli := dial(addr)
-	defer conn.Close()
-	c, cancel := ctx()
-	defer cancel()
-	r, err := cli.Status(c, &raftpb.StatusRequest{})
-	if err != nil {
-		fail("rpc error: %v", err)
-	}
-	fmt.Printf("node=%s role=%s term=%d leader=%s commit=%d applied=%d snapshot=%d logLen=%d keys=%d peers=%v\n",
-		r.GetNodeId(), r.GetRole(), r.GetTerm(), r.GetLeaderId(),
-		r.GetCommitIndex(), r.GetLastApplied(), r.GetSnapshotIndex(), r.GetLogLen(),
-		r.GetNumKeys(), r.GetPeers())
+	followLeader(addr, func(c context.Context, cli raftpb.KVClient) (string, error) {
+		r, err := cli.Status(c, &raftpb.StatusRequest{})
+		if err != nil {
+			return "", err
+		}
+		fmt.Printf("node=%s role=%s term=%d leader=%s commit=%d applied=%d snapshot=%d logLen=%d keys=%d digest=%s peers=%v\n",
+			r.GetNodeId(), r.GetRole(), r.GetTerm(), r.GetLeaderId(), r.GetCommitIndex(), r.GetLastApplied(),
+			r.GetSnapshotIndex(), r.GetLogLen(), r.GetNumKeys(), r.GetStateDigest(), r.GetPeers())
+		return "", nil
+	})
 }
 
 func need(args []string, n int) {

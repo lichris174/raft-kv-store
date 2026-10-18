@@ -45,8 +45,8 @@ func main() {
 	grpcServer := grpc.NewServer()
 	raftpb.RegisterKVServer(grpcServer, kv)
 
-	// Only run Raft when peers are configured; a lone node stays the Feature 1
-	// single-node path (always its own leader) without election churn.
+	// Only run Raft when peers are configured; a lone node is its own leader and
+	// applies writes directly.
 	if len(peers) > 0 {
 		var persister Persister
 		if *dataDir != "" {

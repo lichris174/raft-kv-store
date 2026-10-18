@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 )
@@ -56,11 +57,27 @@ func TestKVStore_Concurrent(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			key := "k"
+			key := fmt.Sprint("k", n%10) // a few keys, each shared by several goroutines
 			s.Set(key, "v")
 			_, _ = s.Get(key)
 			_ = s.Len()
 		}(i)
 	}
 	wg.Wait()
+}
+
+// Digest is equal exactly when contents are equal, whatever the insert order.
+func TestKVStore_DigestTracksContents(t *testing.T) {
+	a, b := NewKVStore(), NewKVStore()
+	a.Set("x", "1")
+	a.Set("y", "2")
+	b.Set("y", "2")
+	b.Set("x", "1")
+	if a.Digest() != b.Digest() {
+		t.Fatal("equal stores have different digests")
+	}
+	b.Set("y", "3")
+	if a.Digest() == b.Digest() {
+		t.Fatal("different stores have the same digest")
+	}
 }

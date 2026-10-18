@@ -2,13 +2,16 @@
 // Browsers cannot spawn processes, so this server:
 //
 //   - owns a 5-node demo cluster (start/stop all, kill/start one node), and
+//
 //   - runs the benchmark and chaos harnesses as child processes, streaming
 //     their output to the page over Server-Sent Events.
 //
-//	go run ./control            # serves http://localhost:8090
+//     go run ./control            # serves http://localhost:8090
 //
-// Every endpoint that changes anything requires POST, and the server listens on
-// loopback only, so a web page the user happens to visit cannot drive it.
+// The server listens on loopback only, every endpoint that changes anything
+// requires POST, and requests must come from a local page with a local Host
+// header, so a web page the user happens to visit cannot drive it (by a
+// cross-site form post or by DNS rebinding).
 // One test run executes at a time and pauses the demo cluster (they share ports).
 // The dashboard in dashboard/ is served at /.
 package main
@@ -16,67 +19,97 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
-// event is one SSE message. Kinds: start | line | end.
+// event is one SSE message. T is "start", "line" or "end".
 type event struct {
 	T    string `json:"t"`
 	Kind string `json:"kind,omitempty"` // "bench" | "chaos" (on start)
 	Cmd  string `json:"cmd,omitempty"`  // resolved command (on start)
 	S    string `json:"s,omitempty"`    // a line of output (on line)
-	Code int    `json:"code,omitempty"` // exit code (on end)
+	Code int    `json:"code"`           // exit code (on end); never omitted, 0 means success
 }
 
-// hub fans out job output to all connected SSE clients and enforces a single
-// concurrent job.
+// maxHistory bounds the replay buffer (a chaos run prints a few hundred lines).
+const maxHistory = 5000
+
+// hub runs at most one harness at a time and fans its output out to every
+// connected SSE client. It keeps the current (or last) run's events so a page
+// that connects or reloads mid-run gets the whole run, verdict included.
 type hub struct {
-	mu      sync.Mutex
-	subs    map[chan event]struct{}
-	running bool
-	kind    string
-	proc    *os.Process
+	mu       sync.Mutex
+	subs     map[chan event]struct{}
+	history  []event
+	running  bool
+	kind     string
+	proc     *os.Process
+	stopWant bool // Stop arrived before the process existed
 }
 
 func newHub() *hub { return &hub{subs: map[chan event]struct{}{}} }
 
-func (h *hub) sub() chan event {
-	ch := make(chan event, 512)
+// subscribe registers a client and returns the events it has missed so far.
+func (h *hub) subscribe() (chan event, []event) {
+	ch := make(chan event, 1024)
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.subs[ch] = struct{}{}
-	h.mu.Unlock()
-	return ch
+	return ch, append([]event(nil), h.history...)
 }
 
-func (h *hub) unsub(ch chan event) {
+func (h *hub) unsubscribe(ch chan event) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if _, ok := h.subs[ch]; ok {
 		delete(h.subs, ch)
 		close(ch)
 	}
-	h.mu.Unlock()
 }
 
 func (h *hub) emit(e event) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.emitLocked(e)
+}
+
+// emitLocked records e for replay and sends it to every client. A full history
+// still records start and end, so a late page always learns how the run ended.
+// A client too slow to keep up is disconnected rather than silently skipped;
+// its browser reconnects and the replay brings it back in sync.
+func (h *hub) emitLocked(e event) {
+	if len(h.history) < maxHistory || e.T != "line" {
+		h.history = append(h.history, e)
+	}
 	for ch := range h.subs {
 		select {
 		case ch <- e:
-		default: // slow client: drop rather than block the job
+		default:
+			delete(h.subs, ch)
+			close(ch)
 		}
 	}
+}
+
+func (h *hub) status() (running bool, kind string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.running, h.kind
 }
 
 // start launches a PowerShell harness. args are appended after the script path.
@@ -86,81 +119,94 @@ func (h *hub) start(kind, script string, args []string) error {
 		h.mu.Unlock()
 		return fmt.Errorf("a %s run is already in progress", h.kind)
 	}
-	h.running = true
-	h.kind = kind
+	h.running, h.kind, h.history, h.stopWant = true, kind, nil, false
 	h.mu.Unlock()
 
-	psArgs := append([]string{
-		"-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script,
-	}, args...)
+	pr, pw := io.Pipe()
+	cmd := exec.Command("powershell", append([]string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script}, args...)...)
+	cmd.Stdout, cmd.Stderr = pw, pw
+	// Nodes the script starts can inherit the output pipe and keep it open after
+	// the script exits. WaitDelay makes Wait give up on the pipe a second after
+	// the script itself is gone, so the run always ends.
+	cmd.WaitDelay = time.Second
 
+	h.emit(event{T: "start", Kind: kind, Cmd: "powershell " + script + " " + strings.Join(args, " ")})
+	if err := cmd.Start(); err != nil {
+		h.finish(-1, "failed to start: "+err.Error())
+		return nil
+	}
+	h.mu.Lock()
+	h.proc = cmd.Process
+	stopNow := h.stopWant
+	h.mu.Unlock()
+	if stopNow {
+		h.stop()
+	}
+
+	waited := make(chan error, 1)
 	go func() {
-		defer func() {
-			h.mu.Lock()
-			h.running = false
-			h.proc = nil
-			h.mu.Unlock()
-		}()
-
-		pr, pw := io.Pipe()
-		cmd := exec.Command("powershell", psArgs...)
-		cmd.Stdout = pw
-		cmd.Stderr = pw
-
-		h.emit(event{T: "start", Kind: kind, Cmd: "powershell " + script + " " + joinArgs(args)})
-
-		if err := cmd.Start(); err != nil {
-			h.emit(event{T: "line", S: "failed to start: " + err.Error()})
-			h.emit(event{T: "end", Code: -1})
-			_ = pw.Close()
-			return
-		}
-		h.mu.Lock()
-		h.proc = cmd.Process
-		h.mu.Unlock()
-
-		done := make(chan error, 1)
-		go func() {
-			done <- cmd.Wait()
-			_ = pw.Close()
-		}()
-
+		err := cmd.Wait()
+		pw.Close() // ends the scan below once every line has been read
+		waited <- err
+	}()
+	go func() {
 		sc := bufio.NewScanner(pr)
 		sc.Buffer(make([]byte, 1<<20), 1<<20)
 		for sc.Scan() {
 			h.emit(event{T: "line", S: sc.Text()})
 		}
-
+		io.Copy(io.Discard, pr) // drain an over-long line so the writer never blocks
+		err := <-waited
 		code := 0
-		if err := <-done; err != nil {
-			if ee, ok := err.(*exec.ExitError); ok {
-				code = ee.ExitCode()
-			} else {
-				code = -1
-			}
+		var exitErr *exec.ExitError
+		switch {
+		case errors.As(err, &exitErr):
+			code = exitErr.ExitCode()
+		case err != nil && !errors.Is(err, exec.ErrWaitDelay):
+			code = -1
 		}
-		h.emit(event{T: "end", Code: code})
+		h.mu.Lock()
+		h.proc = nil
+		h.mu.Unlock()
+		h.finish(code, "") // only after the last line, so the verdict line is never late
 	}()
 	return nil
 }
 
-// stop kills the running harness process. The harnesses kill stale raftnode
-// processes on their next launch, so any orphaned nodes are reclaimed then;
-// stopNodes() also clears them immediately.
+// finish marks the run over before announcing it, so a client that reacts to
+// the end event can start the next run straight away.
+func (h *hub) finish(code int, line string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if line != "" {
+		h.emitLocked(event{T: "line", S: line})
+	}
+	// One critical section: a new run cannot start between these two, so this
+	// end event can never land in the next run's history.
+	h.running = false
+	h.emitLocked(event{T: "end", Code: code})
+}
+
+// stop kills the running harness together with everything it started (the
+// benchmark or raftctl), then any raftnode left behind.
 func (h *hub) stop() {
 	h.mu.Lock()
 	p := h.proc
+	h.stopWant = h.running && p == nil
 	h.mu.Unlock()
 	if p != nil {
-		_ = p.Kill()
+		_ = exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(p.Pid)).Run()
 	}
-	stopNodes()
+	killStrayNodes()
 }
 
-// stopNodes force-kills any lingering raftnode processes.
-func stopNodes() {
+// killStrayNodes force-kills raftnode processes started by the harnesses or the
+// demo cluster (their data lives under %TEMP%aft-kv-store), and no others.
+func killStrayNodes() {
 	_ = exec.Command("powershell", "-NoProfile", "-Command",
-		"Get-Process raftnode -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue").Run()
+		`Get-CimInstance Win32_Process -Filter "Name='raftnode.exe'" | `+
+			`Where-Object { $_.CommandLine -like '*raft-kv-store*' } | `+
+			`ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`).Run()
 }
 
 func (h *hub) stream(w http.ResponseWriter, r *http.Request) {
@@ -173,11 +219,13 @@ func (h *hub) stream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	ch := h.sub()
-	defer h.unsub(ch)
-
-	// Greet so the client knows the stream is live.
-	writeSSE(w, fl, event{T: "line", S: "[control] connected, ready"})
+	ch, backlog := h.subscribe()
+	defer h.unsubscribe(ch)
+	writeSSE(w, event{T: "reset"}) // the client clears its view, then the backlog rebuilds it
+	for _, e := range backlog {
+		writeSSE(w, e)
+	}
+	fl.Flush()
 
 	ping := time.NewTicker(15 * time.Second)
 	defer ping.Stop()
@@ -185,8 +233,12 @@ func (h *hub) stream(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
-		case e := <-ch:
-			writeSSE(w, fl, e)
+		case e, ok := <-ch:
+			if !ok {
+				return // dropped for being slow; the browser reconnects and replays
+			}
+			writeSSE(w, e)
+			fl.Flush()
 		case <-ping.C:
 			fmt.Fprint(w, ": ping\n\n") // SSE comment keeps the connection warm
 			fl.Flush()
@@ -194,26 +246,16 @@ func (h *hub) stream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func writeSSE(w http.ResponseWriter, fl http.Flusher, e event) {
+func writeSSE(w io.Writer, e event) {
 	b, _ := json.Marshal(e)
 	fmt.Fprintf(w, "data: %s\n\n", b)
-	fl.Flush()
-}
-
-func joinArgs(a []string) string {
-	out := ""
-	for i, s := range a {
-		if i > 0 {
-			out += " "
-		}
-		out += s
-	}
-	return out
 }
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8090", "control server listen address (keep it on loopback)")
 	root := flag.String("root", ".", "repo root (where scripts/ and dashboard/ live)")
+	data := flag.String("data", filepath.Join(os.TempDir(), "raft-kv-store", "demo"),
+		"demo cluster data directory (keep it out of OneDrive/Dropbox: sync clients lock files mid-write)")
 	flag.Parse()
 
 	abs, err := filepath.Abs(*root)
@@ -228,8 +270,7 @@ func main() {
 	}
 
 	h := newHub()
-	cl := newCluster(abs)
-	mux := http.NewServeMux()
+	cl := newCluster(abs, *data)
 
 	// Leave no orphaned nodes behind when the control server exits.
 	sig := make(chan os.Signal, 1)
@@ -240,145 +281,152 @@ func main() {
 		os.Exit(0)
 	}()
 
-	mux.HandleFunc("/stream", h.stream)
-
-	mux.HandleFunc("/bench", post(func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query()
-		args := []string{
-			"-Writers", clampInt(q.Get("writers"), 1, 256, 24),
-			"-Readers", clampInt(q.Get("readers"), 1, 256, 16),
-			"-Duration", durArg(q.Get("duration"), "5s"),
-			"-Threshold", clampInt(q.Get("threshold"), 25, 100000, 2000),
-		}
-		if !h.begin(w, cl, "bench", filepath.Join("scripts", "bench.ps1"), args) {
-			return
-		}
-	}))
-
-	mux.HandleFunc("/chaos", post(func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query()
-		args := []string{
-			"-Rounds", clampInt(q.Get("rounds"), 1, 100, 8),
-			"-Threshold", clampInt(q.Get("threshold"), 5, 100000, 25),
-		}
-		if q.Get("killLeader") == "1" {
-			args = append(args, "-KillLeader")
-		}
-		if !h.begin(w, cl, "chaos", filepath.Join("scripts", "chaos.ps1"), args) {
-			return
-		}
-	}))
-
-	mux.HandleFunc("/stop", post(func(w http.ResponseWriter, r *http.Request) {
-		h.stop()
-		cl.stopAll()
-		writeJSON(w, http.StatusOK, map[string]bool{"stopped": true})
-	}))
-
-	// GET /cluster: the demo cluster's processes plus whether a test run is active.
-	mux.HandleFunc("/cluster", func(w http.ResponseWriter, r *http.Request) {
-		h.mu.Lock()
-		busy, kind := h.running, h.kind
-		h.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{"nodes": cl.state(), "busy": busy, "kind": kind})
-	})
-
-	mux.HandleFunc("/cluster/start", post(func(w http.ResponseWriter, r *http.Request) {
-		if h.isRunning() {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "a test run is using the cluster ports; stop it first"})
-			return
-		}
-		if err := cl.startAll(r.URL.Query().Get("fresh") == "1"); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-	}))
-
-	mux.HandleFunc("/cluster/stop", post(func(w http.ResponseWriter, r *http.Request) {
-		cl.stopAll()
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-	}))
-
-	mux.HandleFunc("/node/kill", post(nodeAction(h, cl.killNode)))
-	mux.HandleFunc("/node/start", post(nodeAction(h, cl.startNode)))
-
-	mux.Handle("/", http.FileServer(http.Dir(filepath.Join(abs, "dashboard"))))
-
-	log.Printf("control plane on %s  (root=%s)", *addr, abs)
+	log.Printf("control plane on %s  (root=%s, demo data=%s)", *addr, abs, *data)
 	log.Printf("open http://%s", *addr)
-	if err := http.ListenAndServe(*addr, mux); err != nil {
+	if err := http.ListenAndServe(*addr, localOnly(routes(h, cl, abs))); err != nil {
 		log.Fatal(err)
 	}
 }
 
-// post restricts a handler to POST. Mutating endpoints must not be reachable by
-// a plain GET (an <img> tag or link on any web page can issue one).
-func post(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.Header().Set("Allow", http.MethodPost)
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "use POST"})
-			return
+func routes(h *hub, cl *cluster, root string) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /stream", h.stream)
+
+	mux.HandleFunc("POST /bench", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		h.begin(w, cl, "bench", filepath.Join("scripts", "bench.ps1"), []string{
+			"-Writers", clampArg(q.Get("writers"), 1, 256, 24),
+			"-Readers", clampArg(q.Get("readers"), 1, 256, 16),
+			"-Duration", durArg(q.Get("duration"), "5s"),
+			"-Threshold", clampArg(q.Get("threshold"), 25, 100000, 2000),
+		})
+	})
+
+	mux.HandleFunc("POST /chaos", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		args := []string{
+			"-Rounds", clampArg(q.Get("rounds"), 1, 100, 8),
+			"-Threshold", clampArg(q.Get("threshold"), 5, 100000, 25),
 		}
-		next(w, r)
-	}
+		if q.Get("killLeader") == "1" {
+			args = append(args, "-KillLeader")
+		}
+		h.begin(w, cl, "chaos", filepath.Join("scripts", "chaos.ps1"), args)
+	})
+
+	mux.HandleFunc("POST /stop", func(w http.ResponseWriter, r *http.Request) {
+		h.stop()
+		cl.stopAll()
+		writeJSON(w, http.StatusOK, map[string]bool{"stopped": true})
+	})
+
+	// The demo cluster's processes plus whether a test run is active.
+	mux.HandleFunc("GET /cluster", func(w http.ResponseWriter, r *http.Request) {
+		busy, kind := h.status()
+		writeJSON(w, http.StatusOK, map[string]any{"nodes": cl.state(), "busy": busy, "kind": kind})
+	})
+
+	mux.HandleFunc("POST /cluster/start", h.unlessBusy(func(r *http.Request) error {
+		return cl.startAll(r.URL.Query().Get("fresh") == "1")
+	}))
+	mux.HandleFunc("POST /cluster/stop", func(w http.ResponseWriter, r *http.Request) {
+		cl.stopAll()
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	})
+	mux.HandleFunc("POST /node/kill", h.unlessBusy(func(r *http.Request) error { return cl.killNode(r.URL.Query().Get("id")) }))
+	mux.HandleFunc("POST /node/start", h.unlessBusy(func(r *http.Request) error { return cl.startNode(r.URL.Query().Get("id")) }))
+
+	mux.Handle("/", http.FileServer(http.Dir(filepath.Join(root, "dashboard"))))
+	return mux
 }
 
-func nodeAction(h *hub, act func(id string) error) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if h.isRunning() {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "a test run is in progress"})
+// localOnly refuses requests that did not come from a page on this machine: a
+// non-local Origin (a cross-site form post or fetch) or a non-local Host (DNS
+// rebinding, where an attacker's hostname resolves to 127.0.0.1).
+func localOnly(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if host, _, err := net.SplitHostPort(r.Host); err != nil || !isLocalHost(host) {
+			writeErr(w, http.StatusForbidden, "requests must address localhost")
 			return
 		}
-		if err := act(r.URL.Query().Get("id")); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		if o := r.Header.Get("Origin"); o != "" {
+			if u, err := url.Parse(o); err != nil || !isLocalHost(u.Hostname()) {
+				writeErr(w, http.StatusForbidden, "cross-origin request from a non-local page")
+				return
+			}
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+func isLocalHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+// unlessBusy runs a demo-cluster action, refusing while a test run owns the
+// cluster ports. The hub stays locked during the action, so a run cannot start
+// halfway through it (lock order is always hub, then cluster).
+func (h *hub) unlessBusy(act func(*http.Request) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		h.mu.Lock()
+		err := errBusy
+		if !h.running {
+			err = act(r)
+		}
+		h.mu.Unlock()
+		if err == errBusy {
+			writeErr(w, http.StatusConflict, "a test run is using the cluster ports; stop it first")
+			return
+		}
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	}
 }
 
-func (h *hub) isRunning() bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.running
-}
+var errBusy = errors.New("busy")
 
 // begin pauses the demo cluster (a test run starts its own on the same ports)
 // and launches the harness, replying to the HTTP request either way.
-func (h *hub) begin(w http.ResponseWriter, cl *cluster, kind, script string, args []string) bool {
-	if h.isRunning() {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "a test run is already in progress"})
-		return false
+func (h *hub) begin(w http.ResponseWriter, cl *cluster, kind, script string, args []string) {
+	if busy, _ := h.status(); busy {
+		writeErr(w, http.StatusConflict, "a test run is already in progress")
+		return
 	}
 	cl.stopAll()
 	if err := h.start(kind, script, args); err != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
-		return false
+		writeErr(w, http.StatusConflict, err.Error())
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"started": true})
-	return true
 }
 
+// writeJSON is the same small helper as in server/http.go; the two binaries
+// share no package on purpose.
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func clampInt(s string, lo, hi, def int) string {
+func writeErr(w http.ResponseWriter, code int, msg string) {
+	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+// clampArg parses s as an int, clamps it to [lo, hi] (def if unparsable), and
+// returns it as a command-line argument.
+func clampArg(s string, lo, hi, def int) string {
 	n, err := strconv.Atoi(s)
 	if err != nil {
 		return strconv.Itoa(def)
 	}
-	if n < lo {
-		n = lo
-	}
-	if n > hi {
-		n = hi
-	}
-	return strconv.Itoa(n)
+	return strconv.Itoa(min(max(n, lo), hi))
 }
 
 // durArg sanitizes a Go duration string (e.g. "5s", "10s"); falls back to def.

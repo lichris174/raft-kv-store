@@ -69,7 +69,7 @@ type GetReply struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Value         string                 `protobuf:"bytes,1,opt,name=value,proto3" json:"value,omitempty"`
 	Found         bool                   `protobuf:"varint,2,opt,name=found,proto3" json:"found,omitempty"`
-	LeaderHint    string                 `protobuf:"bytes,3,opt,name=leader_hint,json=leaderHint,proto3" json:"leader_hint,omitempty"` // set when a non-leader cannot serve (later features)
+	LeaderHint    string                 `protobuf:"bytes,3,opt,name=leader_hint,json=leaderHint,proto3" json:"leader_hint,omitempty"` // set when a non-leader cannot serve a leader-mode read
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -478,11 +478,14 @@ func (x *LogEntry) GetValue() string {
 }
 
 type RequestVoteArgs struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
-	CandidateId   string                 `protobuf:"bytes,2,opt,name=candidate_id,json=candidateId,proto3" json:"candidate_id,omitempty"` // candidate's advertised (dialable) address
-	LastLogIndex  uint64                 `protobuf:"varint,3,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
-	LastLogTerm   uint64                 `protobuf:"varint,4,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	Term         uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	CandidateId  string                 `protobuf:"bytes,2,opt,name=candidate_id,json=candidateId,proto3" json:"candidate_id,omitempty"` // candidate's advertised (dialable) address
+	LastLogIndex uint64                 `protobuf:"varint,3,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
+	LastLogTerm  uint64                 `protobuf:"varint,4,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
+	// A pre-vote asks "would you vote for me in this term?" without either side
+	// changing state, so a node that cannot win never inflates its term.
+	PreVote       bool `protobuf:"varint,5,opt,name=pre_vote,json=preVote,proto3" json:"pre_vote,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -545,6 +548,13 @@ func (x *RequestVoteArgs) GetLastLogTerm() uint64 {
 	return 0
 }
 
+func (x *RequestVoteArgs) GetPreVote() bool {
+	if x != nil {
+		return x.PreVote
+	}
+	return false
+}
+
 type RequestVoteReply struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
@@ -603,7 +613,7 @@ type AppendEntriesArgs struct {
 	LeaderId      string                 `protobuf:"bytes,2,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"` // leader's advertised (dialable) address
 	PrevLogIndex  uint64                 `protobuf:"varint,3,opt,name=prev_log_index,json=prevLogIndex,proto3" json:"prev_log_index,omitempty"`
 	PrevLogTerm   uint64                 `protobuf:"varint,4,opt,name=prev_log_term,json=prevLogTerm,proto3" json:"prev_log_term,omitempty"`
-	Entries       []*LogEntry            `protobuf:"bytes,5,rep,name=entries,proto3" json:"entries,omitempty"` // empty for heartbeat (Feature 2)
+	Entries       []*LogEntry            `protobuf:"bytes,5,rep,name=entries,proto3" json:"entries,omitempty"` // empty for a heartbeat
 	LeaderCommit  uint64                 `protobuf:"varint,6,opt,name=leader_commit,json=leaderCommit,proto3" json:"leader_commit,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -682,9 +692,12 @@ func (x *AppendEntriesArgs) GetLeaderCommit() uint64 {
 }
 
 type AppendEntriesReply struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
-	Success       bool                   `protobuf:"varint,2,opt,name=success,proto3" json:"success,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Term    uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	Success bool                   `protobuf:"varint,2,opt,name=success,proto3" json:"success,omitempty"`
+	// Follower's last log index, so a leader whose prev entry was rejected can
+	// jump straight back instead of retrying one index at a time.
+	LastIndex     uint64 `protobuf:"varint,3,opt,name=last_index,json=lastIndex,proto3" json:"last_index,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -731,6 +744,13 @@ func (x *AppendEntriesReply) GetSuccess() bool {
 		return x.Success
 	}
 	return false
+}
+
+func (x *AppendEntriesReply) GetLastIndex() uint64 {
+	if x != nil {
+		return x.LastIndex
+	}
+	return 0
 }
 
 type StatusRequest struct {
@@ -781,6 +801,9 @@ type StatusReply struct {
 	NumKeys       int32                  `protobuf:"varint,8,opt,name=num_keys,json=numKeys,proto3" json:"num_keys,omitempty"`
 	SnapshotIndex uint64                 `protobuf:"varint,9,opt,name=snapshot_index,json=snapshotIndex,proto3" json:"snapshot_index,omitempty"`
 	LogLen        int32                  `protobuf:"varint,10,opt,name=log_len,json=logLen,proto3" json:"log_len,omitempty"`
+	// Hash of the state machine's contents. Equal digests mean equal data, which
+	// lets a test compare nodes without reading every key from each.
+	StateDigest   string `protobuf:"bytes,11,opt,name=state_digest,json=stateDigest,proto3" json:"state_digest,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -885,6 +908,13 @@ func (x *StatusReply) GetLogLen() int32 {
 	return 0
 }
 
+func (x *StatusReply) GetStateDigest() string {
+	if x != nil {
+		return x.StateDigest
+	}
+	return ""
+}
+
 var File_proto_raft_proto protoreflect.FileDescriptor
 
 const file_proto_raft_proto_rawDesc = "" +
@@ -923,12 +953,13 @@ const file_proto_raft_proto_rawDesc = "" +
 	"\x05index\x18\x02 \x01(\x04R\x05index\x12\x0e\n" +
 	"\x02op\x18\x03 \x01(\tR\x02op\x12\x10\n" +
 	"\x03key\x18\x04 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x05 \x01(\tR\x05value\"\x92\x01\n" +
+	"\x05value\x18\x05 \x01(\tR\x05value\"\xad\x01\n" +
 	"\x0fRequestVoteArgs\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
 	"\fcandidate_id\x18\x02 \x01(\tR\vcandidateId\x12$\n" +
 	"\x0elast_log_index\x18\x03 \x01(\x04R\flastLogIndex\x12\"\n" +
-	"\rlast_log_term\x18\x04 \x01(\x04R\vlastLogTerm\"I\n" +
+	"\rlast_log_term\x18\x04 \x01(\x04R\vlastLogTerm\x12\x19\n" +
+	"\bpre_vote\x18\x05 \x01(\bR\apreVote\"I\n" +
 	"\x10RequestVoteReply\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
 	"\fvote_granted\x18\x02 \x01(\bR\vvoteGranted\"\xdd\x01\n" +
@@ -938,11 +969,13 @@ const file_proto_raft_proto_rawDesc = "" +
 	"\x0eprev_log_index\x18\x03 \x01(\x04R\fprevLogIndex\x12\"\n" +
 	"\rprev_log_term\x18\x04 \x01(\x04R\vprevLogTerm\x12(\n" +
 	"\aentries\x18\x05 \x03(\v2\x0e.raft.LogEntryR\aentries\x12#\n" +
-	"\rleader_commit\x18\x06 \x01(\x04R\fleaderCommit\"B\n" +
+	"\rleader_commit\x18\x06 \x01(\x04R\fleaderCommit\"a\n" +
 	"\x12AppendEntriesReply\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\"\x0f\n" +
-	"\rStatusRequest\"\xa2\x02\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\x12\x1d\n" +
+	"\n" +
+	"last_index\x18\x03 \x01(\x04R\tlastIndex\"\x0f\n" +
+	"\rStatusRequest\"\xc5\x02\n" +
 	"\vStatusReply\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x12\n" +
 	"\x04role\x18\x02 \x01(\tR\x04role\x12\x12\n" +
@@ -954,7 +987,8 @@ const file_proto_raft_proto_rawDesc = "" +
 	"\bnum_keys\x18\b \x01(\x05R\anumKeys\x12%\n" +
 	"\x0esnapshot_index\x18\t \x01(\x04R\rsnapshotIndex\x12\x17\n" +
 	"\alog_len\x18\n" +
-	" \x01(\x05R\x06logLen2\xbb\x01\n" +
+	" \x01(\x05R\x06logLen\x12!\n" +
+	"\fstate_digest\x18\v \x01(\tR\vstateDigest2\xbb\x01\n" +
 	"\x02KV\x12'\n" +
 	"\x03Get\x12\x10.raft.GetRequest\x1a\x0e.raft.GetReply\x12)\n" +
 	"\x03Set\x12\x10.raft.SetRequest\x1a\x10.raft.WriteReply\x12/\n" +

@@ -1,10 +1,11 @@
 # bench.ps1: launch a local cluster, run the benchmark, save a report.
 #
-#   pwsh scripts/bench.ps1 [-N 5] [-Writers 24] [-Readers 16] [-Duration 5s] [-Fsync]
+#   powershell -File scripts\bench.ps1 [-N 5] [-Writers 24] [-Readers 16] [-Duration 5s] [-Fsync]
 #
 # -Fsync starts the cluster with --fsync so every durable write is flushed to
 # disk before it is acknowledged. Use it to measure the power-loss-durability
-# latency tradeoff against the default (page-cache) mode.
+# latency tradeoff against the default (page-cache) mode. The exit code is
+# raftbench's: non-zero if the cluster never came up or any operation failed.
 param(
   [int]$N = 5,
   [int]$Writers = 24,
@@ -12,62 +13,45 @@ param(
   [string]$Duration = "5s",
   [int]$Base = 9001,
   [int]$Threshold = 2000,
-  [switch]$Fsync
+  [switch]$Fsync,
+  # Outside OneDrive on purpose: sync clients lock files while nodes rewrite them.
+  [string]$DataRoot = (Join-Path $env:TEMP "raft-kv-store\bench")
 )
 $ErrorActionPreference = "Stop"
-$root = Split-Path -Parent $PSScriptRoot
-Set-Location $root
-if (-not (Test-Path .\bin\raftnode.exe)) { throw "build first: go build -o bin\raftnode.exe ./server" }
-if (-not (Test-Path .\bin\raftctl.exe))  { throw "build first: go build -o bin\raftctl.exe ./client" }
-if (-not (Test-Path .\bin\raftbench.exe)) { throw "build first: go build -o bin\raftbench.exe ./benchmark" }
+. "$PSScriptRoot\lib.ps1"
+Assert-Built raftnode, raftbench
+$nodeArgs = @("--read-mode", "follower")
+if ($Fsync) { $nodeArgs += "--fsync" }
+New-Cluster -Base $Base -N $N -DataRoot $DataRoot -Threshold $Threshold -NodeArgs $nodeArgs
 
-$ports = 0..($N-1) | ForEach-Object { $Base + $_ }
-function Node($port) {
-  $id = "n$($port - $Base + 1)"
-  $peers = ($ports | Where-Object { $_ -ne $port } | ForEach-Object { "localhost:$_" }) -join ","
-  $nodeArgs = @(
-    "--id",$id,"--addr",":$port","--advertise","localhost:$port","--peers",$peers,
-    "--read-mode","follower","--data-dir",".\databench\$id","--snapshot-threshold","$Threshold",
-    "--http",":$($port - 1000)"
-  )
-  if ($Fsync) { $nodeArgs += "--fsync" }
-  Start-Process .\bin\raftnode.exe -PassThru -WindowStyle Hidden -ArgumentList $nodeArgs
+$code = 1
+try {
+  Reset-Cluster
+  Write-Host "launching $N-node cluster..." -ForegroundColor Cyan
+  foreach ($p in $Cluster.Ports) { Start-Node $p }
+  # Nodes answer status as followers during the election, so wait for a leader
+  # too; otherwise the benchmark would start before anyone can accept writes.
+  $ready = Wait-Until { @($Cluster.Ports | Where-Object { Get-NodeStatus $_ }).Count -eq $N -and (Get-LeaderPort) } 15
+  if (-not $ready) { throw "cluster not ready after 15s (node logs: $DataRoot\logs)" }
+  Write-Host "all $N nodes up, leader elected" -ForegroundColor Green
+
+  $addrs = ($Cluster.Ports | ForEach-Object { "localhost:$_" }) -join ","
+  $ErrorActionPreference = "Continue" # a native program's stderr must not abort the script
+  $report = & "$Root\bin\raftbench.exe" -addrs $addrs -writers $Writers -readers $Readers -duration $Duration -keyspace 20000 2>&1 |
+    ForEach-Object { "$_" }
+  $code = $LASTEXITCODE
+  $ErrorActionPreference = "Stop"
+  $report | ForEach-Object { Write-Host $_ }
+  try {
+    $report + "" + "generated: $(Get-Date -Format o)  nodes=$N writers=$Writers readers=$Readers duration=$Duration fsync=$Fsync" |
+      Out-File -Encoding utf8 "$Root\benchmark\report.txt"
+    Write-Host "`nreport saved to benchmark\report.txt" -ForegroundColor Green
+  } catch {
+    Write-Host "WARN: could not save the report: $($_.Exception.Message)" -ForegroundColor Yellow
+  }
+} catch {
+  Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+} finally {
+  Stop-Cluster
 }
-
-# Kill stale raftnode processes from a prior chaos/bench run (they share ports
-# 9001-9005). A straggler holding a port makes a new node fail to bind, which then
-# eats ~1/N of round-robin reads as timeouts and inflates the error count.
-Get-Process raftnode -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 400
-
-if (Test-Path databench) { Remove-Item -Recurse -Force databench }
-Write-Host "launching $N-node cluster..." -ForegroundColor Cyan
-$procs = $ports | ForEach-Object { Node $_ }
-
-# Wait until every node answers status AND a leader has been elected before
-# measuring. Nodes answer status as followers during the election, so checking
-# reachability alone would start the benchmark before a leader exists (then
-# resolveLeader finds none). A node that never comes up can no longer skew results.
-$ctl = ".\bin\raftctl.exe"
-$sw = [Diagnostics.Stopwatch]::StartNew()
-$up = 0; $haveLeader = $false
-do {
-  $statuses = $ports | ForEach-Object { try { & $ctl -addr ":$_" status 2>$null } catch { "" } }
-  $up = @($statuses | Where-Object { $_ -match "role=" }).Count
-  $haveLeader = @($statuses | Where-Object { $_ -match "role=leader" }).Count -gt 0
-  if ($up -eq $N -and $haveLeader) { break }
-  Start-Sleep -Milliseconds 200
-} while ($sw.ElapsedMilliseconds -lt 8000)
-if ($up -ne $N -or -not $haveLeader) {
-  $procs | ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction Stop } catch {} }
-  throw "cluster not ready: $up/$N nodes up, leader=$haveLeader after 8s"
-}
-Write-Host "all $N nodes up, leader elected" -ForegroundColor Green
-
-$addrs = ($ports | ForEach-Object { "localhost:$_" }) -join ","
-$report = .\bin\raftbench.exe -addrs $addrs -writers $Writers -readers $Readers -duration $Duration -keyspace 20000
-$report | Tee-Object -FilePath .\benchmark\report.txt
-Add-Content .\benchmark\report.txt "`ngenerated: $(Get-Date -Format o)  nodes=$N writers=$Writers readers=$Readers duration=$Duration"
-
-$procs | ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction Stop } catch {} }
-Write-Host "`nreport saved to benchmark/report.txt" -ForegroundColor Green
+exit $code

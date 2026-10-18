@@ -1,18 +1,16 @@
 // Load test and fault test panel. Talks to the control server, which runs the
 // PowerShell harnesses and streams their output back over Server-Sent Events.
+// On (re)connect the server replays the current run, so a reload mid-run loses
+// nothing. Uses $, fmt and postAction from app.js, which loads first.
 "use strict";
 
 (function () {
-  const $ = (id) => document.getElementById(id);
-  const fmt = (n) => Number(n).toLocaleString();
-
-  let running = false;
   let kind = null;
-  let bench = {};   // { WRITE: {...}, READ: {...} }
+  let bench = {};       // { WRITE: {...}, READ: {...} }
   let phase = null;
-  let rounds = [];  // [{ n, victim, ok }]
-  let converged = null;
-  let verdict = null;
+  let rounds = [];      // [{ n, victim, ok, detail }]
+  let convergence = null; // { ok, detail }
+  let verdict = null;     // { pass, text }
 
   // ---------------------------------------------------------- stream
 
@@ -21,32 +19,34 @@
     es.onmessage = (ev) => {
       let e;
       try { e = JSON.parse(ev.data); } catch { return; }
-      if (e.t === "start") onStart(e);
+      if (e.t === "reset") { reset(null); setStatus(false); } // replayed events set the real status
+      else if (e.t === "start") onStart(e);
       else if (e.t === "line") onLine(e.s || "");
       else if (e.t === "end") onEnd(e.code);
     };
   }
 
-  function onStart(e) {
-    running = true; kind = e.kind;
-    bench = {}; phase = null; rounds = []; converged = null; verdict = null;
+  function reset(newKind) {
+    kind = newKind;
+    bench = {}; phase = null; rounds = []; convergence = null; verdict = null;
     $("raw-out").textContent = "";
-    $("results").textContent = "";
-    setStatus(true);
     renderResults();
   }
 
+  function onStart(e) {
+    reset(e.kind);
+    setStatus(true);
+  }
+
   function onEnd(code) {
-    running = false;
     setStatus(false, code);
-    if (kind === "chaos") {
-      const bad = rounds.filter((r) => !r.ok).length;
-      verdict = code === 0 && bad === 0 && converged !== false
-        ? { pass: true, text: "Passed. " + rounds.length + " rounds, no committed data lost." }
-        : { pass: false, text: "Failed. " + (bad ? bad + " bad round(s). " : "") + (converged === false ? "Nodes did not converge." : "") };
+    if (kind === "chaos" && !verdict) {
+      // The script ended (or was stopped) before printing its verdict line.
+      verdict = { pass: false, text: "Did not finish (exit code " + code + "). See the raw output." };
+    } else if (kind === "bench" && code !== 0) {
+      verdict = { pass: false, text: "The load test reported a problem (exit code " + code + "). See the errors above or the raw output." };
     }
     renderResults();
-    kind = null;
   }
 
   function onLine(s) {
@@ -58,39 +58,49 @@
   }
 
   // ---------------------------------------------------------- parsing
+  // These follow the output formats documented in benchmark/main.go (print) and
+  // at the top of scripts/chaos.ps1. Patterns are anchored so that stray text
+  // (an error message containing "FAIL", say) can never be mistaken for a result.
 
-  // WRITE   ops=26020     6502 ops/s  errors=24
-  //         latency  p50=2.8ms  p95=7.11ms  p99=24.48ms  max=68.71ms
+  // WRITE   ops=26020     6502 ops/s  errors=0
+  //         error x3: context deadline exceeded
+  //         latency  p50=2.80ms  p95=7.11ms  p99=24.48ms  max=68.71ms
   function parseBench(s) {
     let m = s.match(/^(WRITE|READ)\s+ops=(\d+)\s+([\d.]+)\s+ops\/s\s+errors=(\d+)/);
     if (m) {
       phase = m[1];
-      bench[phase] = Object.assign(bench[phase] || {}, { rate: +m[3], errors: +m[4], ops: +m[2] });
-      return renderResults();
-    }
-    m = s.match(/latency\s+p50=(\S+)\s+p95=(\S+)\s+p99=(\S+)/);
-    if (m && phase) {
+      bench[phase] = { ops: +m[2], rate: +m[3], errors: +m[4], reasons: [] };
+    } else if (phase && (m = s.match(/^\s+error x(\d+): (.*)$/))) {
+      bench[phase].reasons.push(m[2] + " (" + fmt(+m[1]) + ")");
+    } else if (phase && (m = s.match(/^\s+latency\s+p50=(\S+)\s+p95=(\S+)\s+p99=(\S+)/))) {
       Object.assign(bench[phase], { p50: m[1], p95: m[2], p99: m[3] });
-      renderResults();
+    } else {
+      return;
     }
+    renderResults();
   }
 
-  // -- round 3/8 : killing :9002 (n2, leader) --
+  // ROUND 3 KILL n2 (leader)
+  // ROUND 3 RESULT=OK all 33 acknowledged keys read back
+  // CONVERGENCE RESULT=FAIL ...
+  // CHAOS RESULT=PASS 8 rounds, 38 acknowledged writes, none lost
   function parseChaos(s) {
-    let m = s.match(/round\s+(\d+)\/\d+\s*:\s*killing\s+:\d+\s+\((n\d+)(?:,\s*([^)]+))?\)/i);
-    if (m) {
-      rounds.push({ n: +m[1], victim: m[2] + (m[3] ? " (" + m[3] + ")" : ""), ok: null });
-      return renderResults();
+    let m;
+    if ((m = s.match(/^ROUND (\d+) KILL (n\d+) \(([^)]+)\)/))) {
+      rounds.push({ n: +m[1], victim: m[2] + " (" + m[3] + ")", ok: null, detail: "" });
+    } else if ((m = s.match(/^ROUND (\d+) RESULT=(OK|FAIL) ?(.*)$/))) {
+      const r = rounds.find((x) => x.n === +m[1]);
+      if (r) { r.ok = m[2] === "OK"; r.detail = m[3]; }
+    } else if ((m = s.match(/^CONVERGENCE RESULT=(OK|FAIL) ?(.*)$/))) {
+      convergence = { ok: m[1] === "OK", detail: m[2] };
+    } else if ((m = s.match(/^CHAOS RESULT=(PASS|FAIL) ?(.*)$/))) {
+      verdict = { pass: m[1] === "PASS", text: (m[1] === "PASS" ? "Passed: " : "Failed: ") + m[2] };
+    } else if ((m = s.match(/^ERROR: (.*)$/))) {
+      rounds.push({ n: "-", victim: "", ok: false, detail: m[1] });
+    } else {
+      return;
     }
-    const cur = rounds[rounds.length - 1];
-    if (cur && cur.ok === null) {
-      if (/integrity ok/i.test(s)) cur.ok = true;
-      else if (/mismatch|lost quorum|FAIL/i.test(s)) cur.ok = false;
-      else return;
-      return renderResults();
-    }
-    if (/all \d+ nodes hold/i.test(s)) { converged = true; renderResults(); }
-    else if (/nodes diverge|lag/i.test(s) && /FAIL/.test(s)) { converged = false; renderResults(); }
+    renderResults();
   }
 
   // ---------------------------------------------------------- rendering
@@ -102,59 +112,66 @@
     tr.appendChild(td);
   }
 
-  function head(tr, labels) {
-    labels.forEach((t) => { const th = document.createElement("th"); th.textContent = t; tr.appendChild(th); });
+  function table(labels, cls) {
+    const t = document.createElement("table");
+    if (cls) t.className = cls;
+    const h = t.createTHead().insertRow();
+    labels.forEach((l) => { const th = document.createElement("th"); th.textContent = l; h.appendChild(th); });
+    return t;
+  }
+
+  function note(text, cls) {
+    const p = document.createElement("p");
+    p.className = cls;
+    p.textContent = text;
+    return p;
+  }
+
+  function renderBench(out) {
+    const t = table(["", "ops/s", "p50", "p95", "p99", "errors"]);
+    const body = t.createTBody();
+    const reasons = [];
+    [["WRITE", "Writes"], ["READ", "Reads"]].forEach(([k, label]) => {
+      const d = bench[k];
+      if (!d) return;
+      const tr = body.insertRow();
+      cell(tr, label);
+      cell(tr, fmt(Math.round(d.rate)));
+      cell(tr, d.p50 || ""); cell(tr, d.p95 || ""); cell(tr, d.p99 || "");
+      cell(tr, fmt(d.errors), d.errors ? "bad" : "");
+      d.reasons.forEach((r) => reasons.push(label + ": " + r));
+    });
+    out.appendChild(t);
+    if (reasons.length) out.appendChild(note("Errors: " + reasons.join("; "), "note"));
+    if (verdict) out.appendChild(note(verdict.text, "verdict fail"));
+  }
+
+  function renderChaos(out) {
+    const t = table(["Round", "Killed", "Result"], "rounds");
+    const body = t.createTBody();
+    rounds.forEach((r) => {
+      const tr = body.insertRow();
+      cell(tr, r.n === "-" ? "Error" : "Round " + r.n);
+      cell(tr, r.victim, "left");
+      const text = r.ok === null ? "checking" : r.ok ? "all data intact" : "FAILED: " + r.detail;
+      cell(tr, text, r.ok === false ? "bad left" : r.ok ? "good" : "");
+    });
+    if (convergence) {
+      const tr = body.insertRow();
+      cell(tr, "Final");
+      cell(tr, "all nodes compared", "left");
+      cell(tr, convergence.ok ? "identical on every node" : "FAILED: " + convergence.detail,
+        convergence.ok ? "good" : "bad left");
+    }
+    out.appendChild(t);
+    if (verdict) out.appendChild(note(verdict.text, "verdict " + (verdict.pass ? "pass" : "fail")));
   }
 
   function renderResults() {
     const out = $("results");
     out.textContent = "";
-    if (kind === "bench" || (!kind && Object.keys(bench).length)) {
-      const t = document.createElement("table");
-      const h = t.createTHead().insertRow();
-      head(h, ["", "ops/s", "p50", "p95", "p99", "errors"]);
-      const body = t.createTBody();
-      [["WRITE", "Writes"], ["READ", "Reads"]].forEach(([k, label]) => {
-        const d = bench[k];
-        if (!d) return;
-        const tr = body.insertRow();
-        cell(tr, label);
-        cell(tr, d.rate != null ? fmt(Math.round(d.rate)) : "");
-        cell(tr, d.p50 || ""); cell(tr, d.p95 || ""); cell(tr, d.p99 || "");
-        cell(tr, d.errors != null ? fmt(d.errors) : "");
-      });
-      out.appendChild(t);
-      if (!running && Object.keys(bench).length) {
-        const p = document.createElement("p");
-        p.className = "note";
-        p.textContent = "A few errors per worker are normal: each worker's first request can reach a follower before it learns who the leader is.";
-        out.appendChild(p);
-      }
-    } else if (kind === "chaos" || rounds.length) {
-      const t = document.createElement("table");
-      t.className = "rounds";
-      head(t.createTHead().insertRow(), ["Round", "Killed", "Result"]);
-      const body = t.createTBody();
-      rounds.forEach((r) => {
-        const tr = body.insertRow();
-        cell(tr, "Round " + r.n);
-        cell(tr, r.victim, "left");
-        cell(tr, r.ok === null ? "checking" : r.ok ? "data intact" : "DATA MISSING", r.ok === false ? "bad" : r.ok ? "good" : "");
-      });
-      if (converged !== null) {
-        const tr = body.insertRow();
-        cell(tr, "Final");
-        cell(tr, "all nodes compared", "left");
-        cell(tr, converged ? "all agree" : "nodes differ", converged ? "good" : "bad");
-      }
-      out.appendChild(t);
-      if (verdict) {
-        const v = document.createElement("p");
-        v.className = "verdict " + (verdict.pass ? "pass" : "fail");
-        v.textContent = verdict.text;
-        out.appendChild(v);
-      }
-    }
+    if (kind === "bench" && (Object.keys(bench).length || verdict)) renderBench(out);
+    else if (kind === "chaos" && (rounds.length || verdict)) renderChaos(out);
   }
 
   function setStatus(live, code) {
@@ -169,9 +186,8 @@
   // ---------------------------------------------------------- controls
 
   async function start(path, params) {
-    const r = await fetch(path + "?" + new URLSearchParams(params), { method: "POST" });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) $("run-status").textContent = j.error || "Could not start the test.";
+    const err = await postAction(path + "?" + new URLSearchParams(params));
+    if (err) $("run-status").textContent = "Could not start the test: " + err;
   }
 
   $("load-form").addEventListener("submit", (e) => {
@@ -190,9 +206,9 @@
     });
   });
 
-  $("btn-stop-run").addEventListener("click", async () => {
+  $("btn-stop-run").addEventListener("click", () => {
     $("btn-stop-run").disabled = true;
-    await fetch("/stop", { method: "POST" }).catch(() => {});
+    postAction("/stop");
   });
 
   connect();

@@ -10,7 +10,7 @@ func TestNodeArgs(t *testing.T) {
 	if len(specs) != 5 {
 		t.Fatalf("want 5 nodes, got %d", len(specs))
 	}
-	args := strings.Join(nodeArgs(specs[2], specs), " ")
+	args := strings.Join(nodeArgs(specs[2], specs, "d"), " ")
 	for _, want := range []string{
 		"--id n3", "--addr :9003", "--advertise localhost:9003", "--http :8003",
 		"--peers localhost:9001,localhost:9002,localhost:9004,localhost:9005",
@@ -25,7 +25,7 @@ func TestNodeArgs(t *testing.T) {
 }
 
 func TestClusterRejectsUnknownAndStoppedNodes(t *testing.T) {
-	c := newCluster(t.TempDir())
+	c := newCluster(t.TempDir(), t.TempDir())
 	if err := c.killNode("n9"); err == nil {
 		t.Error("kill of unknown node should fail")
 	}

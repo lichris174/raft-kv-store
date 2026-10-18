@@ -2,20 +2,23 @@ package main
 
 import (
 	"context"
+	"errors"
 
 	raftpb "github.com/chrisli/raft-kv-store/proto"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-// kvServer implements the gRPC KV service. Feature 1: a single node that acts
-// as its own leader, serving reads and writes directly from the in-memory
-// store. Later features add Raft so writes are replicated before applying.
+// kvServer implements the gRPC KV service. With Raft enabled, writes are
+// replicated through the leader before they apply; without it (a node started
+// with no peers) the node is its own leader and applies writes directly.
 type kvServer struct {
 	raftpb.UnimplementedKVServer
 	nodeID   string
 	readMode string // "leader" | "follower"
 	peers    []string
 	store    *KVStore
-	raft     *Raft // nil in the single-node Feature 1 tests
+	raft     *Raft // nil when the node runs without peers
 }
 
 func newKVServer(nodeID, readMode string, peers []string) *kvServer {
@@ -27,20 +30,17 @@ func newKVServer(nodeID, readMode string, peers []string) *kvServer {
 	}
 }
 
+// Get serves a read. In follower read mode (or without Raft) any node answers
+// from local state, which may be slightly stale. In leader mode the read is
+// linearizable: only the leader serves, after the read-index check. A node that
+// is not leader redirects; a leader that cannot confirm itself fails the read
+// rather than answer with possibly stale data.
 func (s *kvServer) Get(ctx context.Context, req *raftpb.GetRequest) (*raftpb.GetReply, error) {
-	// Single-node or follower read-mode: serve local committed state directly.
-	// follower mode may return slightly stale data (documented tradeoff).
-	if s.raft == nil || s.readMode == "follower" {
-		v, found := s.store.Get(req.GetKey())
-		return &raftpb.GetReply{Value: v, Found: found}, nil
-	}
-	// leader read-mode: linearizable. Only the leader serves, and only after a
-	// read-index leadership confirmation. Non-leaders redirect via LeaderHint.
-	if !s.raft.IsLeader() {
-		return &raftpb.GetReply{LeaderHint: s.raft.LeaderAddr()}, nil
-	}
-	if !s.raft.ConfirmLeadership(ctx) {
-		return &raftpb.GetReply{LeaderHint: s.raft.LeaderAddr()}, nil
+	if s.raft != nil && s.readMode != "follower" && !s.raft.ConfirmLeadership(ctx) {
+		if hint := s.raft.LeaderAddr(); hint != "" && !s.raft.IsLeader() {
+			return &raftpb.GetReply{LeaderHint: hint}, nil
+		}
+		return nil, status.Error(codes.Unavailable, "no leader can confirm this read; try again")
 	}
 	v, found := s.store.Get(req.GetKey())
 	return &raftpb.GetReply{Value: v, Found: found}, nil
@@ -54,39 +54,40 @@ func (s *kvServer) Delete(ctx context.Context, req *raftpb.DeleteRequest) (*raft
 	return s.propose(ctx, "del", req.GetKey(), "")
 }
 
-// propose routes a write through Raft. With no Raft (single-node Feature 1
-// path) it applies directly. On a follower it returns NOT_LEADER + a hint.
+// propose routes a write through Raft. Without Raft it applies directly. On a
+// follower it fails with "not leader" plus a hint.
 func (s *kvServer) propose(ctx context.Context, op, key, value string) (*raftpb.WriteReply, error) {
 	if s.raft == nil {
 		applyOp(s.store, op, key, value)
 		return &raftpb.WriteReply{Ok: true}, nil
 	}
 	err := s.raft.Propose(ctx, op, key, value)
-	switch {
-	case err == nil:
+	if err == nil {
 		return &raftpb.WriteReply{Ok: true}, nil
-	case err == ErrNotLeader:
-		return &raftpb.WriteReply{Ok: false, Error: "not leader", LeaderHint: s.raft.LeaderAddr()}, nil
-	default:
-		return &raftpb.WriteReply{Ok: false, Error: err.Error()}, nil
 	}
+	reply := &raftpb.WriteReply{Error: err.Error()}
+	if errors.Is(err, ErrNotLeader) {
+		reply.LeaderHint = s.raft.LeaderAddr()
+	}
+	return reply, nil
 }
 
-// applyOp applies a committed operation to the state machine.
-func applyOp(store *KVStore, op, key, value string) {
-	switch op {
-	case "set":
-		store.Set(key, value)
-	case "del":
-		store.Delete(key)
-	}
+func (s *kvServer) Status(context.Context, *raftpb.StatusRequest) (*raftpb.StatusReply, error) {
+	return s.status(true), nil
 }
 
-func (s *kvServer) Status(_ context.Context, _ *raftpb.StatusRequest) (*raftpb.StatusReply, error) {
+// status reports this node's state. The digest hashes the whole store, so the
+// dashboard's frequent polls leave it out (withDigest=false).
+func (s *kvServer) status(withDigest bool) *raftpb.StatusReply {
 	reply := &raftpb.StatusReply{
-		NodeId:  s.nodeID,
-		Peers:   s.peers,
-		NumKeys: int32(s.store.Len()),
+		NodeId:   s.nodeID,
+		Peers:    s.peers,
+		NumKeys:  int32(s.store.Len()),
+		Role:     "leader", // without Raft this node is its own leader
+		LeaderId: s.nodeID,
+	}
+	if withDigest {
+		reply.StateDigest = s.store.Digest()
 	}
 	if s.raft != nil {
 		snap := s.raft.StatusSnapshot()
@@ -97,10 +98,6 @@ func (s *kvServer) Status(_ context.Context, _ *raftpb.StatusRequest) (*raftpb.S
 		reply.LastApplied = snap.LastApplied
 		reply.SnapshotIndex = snap.SnapshotIndex
 		reply.LogLen = int32(snap.LogLen)
-	} else {
-		// Single-node Feature 1 path: no Raft, act as own leader.
-		reply.Role = "leader"
-		reply.LeaderId = s.nodeID
 	}
-	return reply, nil
+	return reply
 }

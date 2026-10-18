@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,11 +25,12 @@ type Meta struct {
 
 // Persister stores durable Raft state. The hot path is AppendLog (O(new
 // entries)); SaveMeta is small and infrequent (elections); Rewrite is rare
-// (compaction, snapshot install, log truncation).
+// (compaction, snapshot install, log truncation). A nil snapshot passed to
+// Rewrite keeps the snapshot already stored.
 type Persister interface {
 	AppendLog(entries []*raftpb.LogEntry) error
 	SaveMeta(meta Meta) error
-	Rewrite(meta Meta, snapshot []byte, log []*raftpb.LogEntry) error
+	Rewrite(meta Meta, snapshot []byte, tail []*raftpb.LogEntry) error
 	Load() (Meta, []byte, []*raftpb.LogEntry, error)
 }
 
@@ -64,18 +66,15 @@ func decodeSnapshot(b []byte) (index, term uint64, data []byte, ok bool) {
 //   - snapshot.bin  : latest state-machine snapshot
 //   - log.jsonl     : one JSON LogEntry per line (append-only; rewritten on
 //     compaction/truncation)
-//
-// By default appends are not fsync'd per entry: state survives a process crash
-// (the bytes are handed to the OS) but not power loss. Set fsync to trade write
-// latency for power-loss durability.
 type filePersister struct {
 	mu      sync.Mutex
-	dir     string
 	metaF   string
 	snapF   string
 	logF    string
-	logFile *os.File
-	logW    *bufio.Writer
+	logFile *os.File      // append handle on log.jsonl; nil after a failed swap
+	logW    *bufio.Writer // buffers one AppendLog call, flushed before it returns
+	logSize int64         // bytes of log.jsonl known to be whole entries
+	broken  error         // set when a failed append could not be undone
 	// fsync forces each durable write through to the physical disk before
 	// returning. Off by default: writes then reach the OS page cache only, which
 	// survives a process crash but not sudden power loss. See the --fsync flag.
@@ -87,92 +86,59 @@ func newFilePersister(dataDir string, fsync bool) (*filePersister, error) {
 		return nil, err
 	}
 	p := &filePersister{
-		dir:   dataDir,
 		metaF: filepath.Join(dataDir, "meta.json"),
 		snapF: filepath.Join(dataDir, "snapshot.bin"),
 		logF:  filepath.Join(dataDir, "log.jsonl"),
 		fsync: fsync,
 	}
-	f, err := os.OpenFile(p.logF, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
+	if err := p.reopenAppendLocked(); err != nil {
 		return nil, err
 	}
-	p.logFile = f
-	p.logW = bufio.NewWriter(f)
 	return p, nil
 }
 
-// Close flushes and releases the append handle. Safe to call once at shutdown.
+// Close flushes and releases the append handle. Tests use it to free the files
+// (Windows will not delete open files); the node process just exits.
 func (p *filePersister) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.logW != nil {
-		_ = p.logW.Flush()
-	}
-	if p.logFile != nil {
-		err := p.logFile.Close()
-		p.logFile = nil
-		return err
-	}
-	return nil
-}
-
-// atomicWrite replaces path via a temp file + rename. When fsync is set the
-// temp file is flushed to disk before the rename, so a power loss cannot leave
-// the renamed file pointing at unwritten data.
-func atomicWrite(path string, data []byte, fsync bool) error {
-	tmp := path + ".tmp"
-	if fsync {
-		f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
-		if err != nil {
-			return err
-		}
-		if _, err := f.Write(data); err != nil {
-			f.Close()
-			return err
-		}
-		if err := f.Sync(); err != nil {
-			f.Close()
-			return err
-		}
-		if err := f.Close(); err != nil {
-			return err
-		}
-	} else if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return p.closeAppendLocked()
 }
 
 func (p *filePersister) AppendLog(entries []*raftpb.LogEntry) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// If a prior Rewrite failed to swap the log file it should have reopened an
-	// append handle already; recover one here so a nil writer never reaches Write.
-	if p.logW == nil {
+	if p.broken != nil {
+		// A fragment from a failed append is still in the file. Try to cut it off
+		// again (the cause, such as a sync client's lock, may have passed).
+		if err := os.Truncate(p.logF, p.logSize); err != nil {
+			return fmt.Errorf("%w (retry: %v)", p.broken, err)
+		}
+		p.broken = nil
+	}
+	if p.logFile == nil { // a previous swap failed and could not reopen
 		if err := p.reopenAppendLocked(); err != nil {
 			return err
 		}
 	}
-	for _, e := range entries {
-		b, err := json.Marshal(e)
-		if err != nil {
-			return err
-		}
-		if _, err := p.logW.Write(b); err != nil {
-			return err
-		}
-		if err := p.logW.WriteByte('\n'); err != nil {
-			return err
-		}
+	n, err := writeEntries(p.logW, entries)
+	if err == nil && p.fsync {
+		err = p.logFile.Sync() // without this the entry is only in the OS page cache
 	}
-	if err := p.logW.Flush(); err != nil {
+	if err != nil {
+		// Part of the batch may be on disk. Cut the file back to the last whole
+		// entry, or a retry would add the same indexes again behind the fragment.
+		// Truncate by path: Windows refuses to truncate through an append-only handle.
+		p.logW.Reset(p.logFile) // drop what is still buffered
+		_ = p.closeAppendLocked()
+		if tErr := os.Truncate(p.logF, p.logSize); tErr != nil {
+			p.broken = fmt.Errorf("log append failed and could not be undone: %w", errors.Join(err, tErr))
+			return p.broken
+		}
+		_ = p.reopenAppendLocked() // if this fails, the next AppendLog retries it
 		return err
 	}
-	// The commit path: without this the entry is only in the OS page cache.
-	if p.fsync {
-		return p.logFile.Sync()
-	}
+	p.logSize += n // counted, not re-read: a failed Stat must never leave a stale size to truncate to
 	return nil
 }
 
@@ -186,12 +152,6 @@ func (p *filePersister) SaveMeta(meta Meta) error {
 	return atomicWrite(p.metaF, b, p.fsync)
 }
 
-// writeSnapshotFileLocked atomically replaces snapshot.bin with a self-describing
-// snapshot for meta.SnapshotIndex/SnapshotTerm.
-func (p *filePersister) writeSnapshotFileLocked(meta Meta, snap []byte) error {
-	return atomicWrite(p.snapF, encodeSnapshot(meta.SnapshotIndex, meta.SnapshotTerm, snap), p.fsync)
-}
-
 // Rewrite persists compaction, snapshot install or a log truncation.
 //
 // Order matters for crash safety: snapshot, then log, then meta. Each step
@@ -200,9 +160,9 @@ func (p *filePersister) writeSnapshotFileLocked(meta Meta, snap []byte) error {
 //     adopts the snapshot's own index and drops the entries it covers.
 //   - snapshot new, log new, meta old: same, the snapshot header wins.
 //
-// Writing meta first (the old order) could record a snapshot index that the
-// snapshot file on disk did not yet reflect, which silently loses state.
-func (p *filePersister) Rewrite(meta Meta, snapshot []byte, log []*raftpb.LogEntry) error {
+// Writing meta first could record a snapshot index that the snapshot file on
+// disk did not yet reflect, which silently loses state.
+func (p *filePersister) Rewrite(meta Meta, snapshot []byte, tail []*raftpb.LogEntry) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	metaJSON, err := json.Marshal(meta)
@@ -210,227 +170,237 @@ func (p *filePersister) Rewrite(meta Meta, snapshot []byte, log []*raftpb.LogEnt
 		return err
 	}
 	if snapshot != nil {
-		if err := p.writeSnapshotFileLocked(meta, snapshot); err != nil {
+		if err := atomicWrite(p.snapF, encodeSnapshot(meta.SnapshotIndex, meta.SnapshotTerm, snapshot), p.fsync); err != nil {
 			return err
 		}
 	}
-	if err := p.swapLogLocked(log); err != nil {
+	if err := p.swapLogLocked(tail); err != nil {
 		return err
 	}
 	return atomicWrite(p.metaF, metaJSON, p.fsync)
 }
 
 // swapLogLocked replaces log.jsonl with exactly the given entries and reopens
-// the append handle. Caller holds p.mu.
-func (p *filePersister) swapLogLocked(log []*raftpb.LogEntry) error {
+// the append handle.
+func (p *filePersister) swapLogLocked(entries []*raftpb.LogEntry) error {
 	tmp := p.logF + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
+	if err := writeFileSynced(tmp, p.fsync, func(w *bufio.Writer) error {
+		_, err := writeEntries(w, entries)
+		return err
+	}); err != nil {
 		return err
 	}
-	w := bufio.NewWriter(f)
-	for _, e := range log {
-		b, err := json.Marshal(e)
-		if err != nil {
-			f.Close()
-			return err
-		}
-		w.Write(b)
-		w.WriteByte('\n')
-	}
-	if err := w.Flush(); err != nil {
-		f.Close()
-		return err
-	}
-	if p.fsync {
-		if err := f.Sync(); err != nil {
-			f.Close()
-			return err
-		}
-	}
-	f.Close()
-	// Close the current append handle so the rename can replace the file;
-	// Windows refuses to replace a file that still has an open handle. Every
-	// failure path below has to reopen a handle before returning, otherwise the
-	// next AppendLog hits a nil writer.
-	if p.logW != nil {
-		_ = p.logW.Flush()
-	}
-	if p.logFile != nil {
-		_ = p.logFile.Close()
-		p.logFile = nil
-	}
-	p.logW = nil
-	// Swap in the new log. Retry the rename: on Windows a sync client (OneDrive)
-	// or AV scanner can briefly hold the target so MoveFileEx fails with "Access
-	// is denied"; the lock clears within a few millis.
+	// Windows refuses to replace a file that still has an open handle.
+	_ = p.closeAppendLocked()
 	if err := renameWithRetry(tmp, p.logF); err != nil {
-		// Could not swap. The original log.jsonl is intact and is a superset of
-		// the new tail (Load reconciles the extra head against the snapshot's
-		// index), so reopen it and keep running rather than wedging the
-		// persister. The next compaction retries the swap.
+		// The original log.jsonl is intact and is a superset of the new tail (Load
+		// reconciles the extra head against the snapshot's index). Keep using it;
+		// the next compaction retries the swap.
 		_ = os.Remove(tmp)
 		if rErr := p.reopenAppendLocked(); rErr != nil {
-			return rErr
+			return errors.Join(err, rErr)
 		}
 		return err
 	}
+	p.broken = nil // the file now holds exactly the entries we wrote
 	return p.reopenAppendLocked()
 }
 
-// reopenAppendLocked (re)opens log.jsonl in append mode and installs a fresh
-// buffered writer. Caller holds p.mu.
+// reopenAppendLocked opens log.jsonl for appending and records its size.
 func (p *filePersister) reopenAppendLocked() error {
-	nf, err := os.OpenFile(p.logF, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(p.logF, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
-	p.logFile = nf
-	p.logW = bufio.NewWriter(nf)
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return err
+	}
+	p.logFile, p.logW = f, bufio.NewWriter(f)
+	if p.broken == nil {
+		// While broken, the file still ends in a fragment; logSize must keep
+		// pointing at the last whole entry so the repair cuts the fragment off.
+		p.logSize = st.Size()
+	}
 	return nil
 }
 
-// renameWithRetry retries os.Rename to absorb transient file locks (on Windows,
-// OneDrive/Defender can briefly hold a file being replaced).
+func (p *filePersister) closeAppendLocked() error {
+	if p.logFile == nil {
+		return nil
+	}
+	_ = p.logW.Flush()
+	err := p.logFile.Close()
+	p.logFile, p.logW = nil, nil
+	return err
+}
+
+// writeEntries writes one JSON entry per line, flushes, and returns the bytes written.
+func writeEntries(w *bufio.Writer, entries []*raftpb.LogEntry) (int64, error) {
+	var n int64
+	for _, e := range entries {
+		b, err := json.Marshal(e)
+		if err != nil {
+			return 0, err
+		}
+		w.Write(b)
+		w.WriteByte('\n')
+		n += int64(len(b)) + 1
+	}
+	return n, w.Flush() // reports any earlier write error: bufio errors are sticky
+}
+
+// writeFileSynced creates path, fills it via fill, and (with fsync) forces it to
+// disk before closing, so a later rename cannot expose unwritten data.
+func writeFileSynced(path string, fsync bool, fill func(*bufio.Writer) error) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	err = fill(bufio.NewWriter(f))
+	if err == nil && fsync {
+		err = f.Sync()
+	}
+	return errors.Join(err, f.Close())
+}
+
+// atomicWrite replaces path via a temp file + rename.
+func atomicWrite(path string, data []byte, fsync bool) error {
+	tmp := path + ".tmp"
+	if err := writeFileSynced(tmp, fsync, func(w *bufio.Writer) error {
+		w.Write(data)
+		return w.Flush()
+	}); err != nil {
+		return err
+	}
+	return renameWithRetry(tmp, path)
+}
+
+// renameWithRetry retries os.Rename to absorb transient file locks. On Windows a
+// sync client (OneDrive) or virus scanner can hold the file being replaced, and
+// MoveFileEx then fails with "Access is denied". Benchmark runs inside a OneDrive
+// folder hit this on meta.json often enough to crash a node, so the window is
+// generous (about 1.2s in total) while the common case still costs one call.
 func renameWithRetry(oldPath, newPath string) error {
 	var err error
-	for attempt := 0; attempt < 10; attempt++ {
+	for attempt := 1; attempt <= 15; attempt++ {
 		if err = os.Rename(oldPath, newPath); err == nil {
 			return nil
 		}
-		time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
+		time.Sleep(time.Duration(attempt) * 10 * time.Millisecond)
 	}
 	return err
 }
 
+// Load reads the persisted state back and repairs the log file if needed.
 func (p *filePersister) Load() (Meta, []byte, []*raftpb.LogEntry, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	var meta Meta
-	if b, err := os.ReadFile(p.metaF); err == nil {
-		// A meta.json that exists but cannot be parsed is an error, not an empty
-		// state: silently resetting the term and votedFor would let this node vote
-		// twice in a term it has already voted in.
-		if err := json.Unmarshal(b, &meta); err != nil {
-			return Meta{}, nil, nil, fmt.Errorf("corrupt %s: %w", p.metaF, err)
-		}
-	} else if !os.IsNotExist(err) {
-		return meta, nil, nil, err
+	meta, err := p.loadMeta()
+	if err != nil {
+		return Meta{}, nil, nil, err
 	}
-	var snap []byte
-	if b, err := os.ReadFile(p.snapF); err == nil {
-		hIndex, hTerm, payload, ok := decodeSnapshot(b)
-		snap = payload
-		if ok {
-			switch {
-			case hIndex > meta.SnapshotIndex:
-				// Crash after the snapshot was written but before meta.json was:
-				// the snapshot is the newer truth.
-				meta.SnapshotIndex, meta.SnapshotTerm = hIndex, hTerm
-			case hIndex < meta.SnapshotIndex:
-				return Meta{}, nil, nil, fmt.Errorf("%s (index %d) is older than meta.json (index %d)", p.snapF, hIndex, meta.SnapshotIndex)
-			}
-		}
-	} else if !os.IsNotExist(err) {
-		return meta, nil, nil, err
+	snap, err := p.loadSnapshot(&meta)
+	if err != nil {
+		return Meta{}, nil, nil, err
 	}
-	var raw []*raftpb.LogEntry
-	nonEmpty := 0
-	endsClean := true
-	if b, err := os.ReadFile(p.logF); err == nil {
-		endsClean = len(b) == 0 || b[len(b)-1] == '\n'
-		for _, line := range splitLines(b) {
-			if len(bytes.TrimSpace(line)) == 0 {
-				continue
-			}
-			nonEmpty++
-			var e raftpb.LogEntry
-			if json.Unmarshal(line, &e) == nil {
-				raw = append(raw, &e)
-			}
-		}
-	} else if !os.IsNotExist(err) {
-		return meta, nil, nil, err
+	raw, lines, endsClean, err := p.readLogFile()
+	if err != nil {
+		return Meta{}, nil, nil, err
 	}
-	// Sanitize: the in-memory offset math (pos = index - snapshotIndex - 1) requires
-	// a contiguous log starting at snapshotIndex+1, strictly increasing by one. Drop
-	// duplicates and stop at the first gap so a partially-written or previously
-	// corrupted file cannot desync the indexing; any dropped tail entries are
-	// refetched from the leader on rejoin.
-	var log []*raftpb.LogEntry
-	expect := meta.SnapshotIndex + 1
-	for _, e := range raw {
-		if e.Index < expect {
-			continue // duplicate / already covered by snapshot
-		}
-		if e.Index > expect {
-			break // gap: rest of the file is unreliable
-		}
-		log = append(log, e)
-		expect++
-	}
+	tail := contiguousTail(raw, meta.SnapshotIndex)
 	// Repair the file so it matches what we just accepted. Otherwise a torn last
 	// line (crash mid-append) or a dropped post-gap tail stays on disk, the next
 	// append lands behind it, and those later entries are discarded again on the
 	// following restart even though they were acknowledged.
-	if len(log) != nonEmpty || !endsClean {
-		if err := p.swapLogLocked(log); err != nil {
+	if len(tail) != lines || !endsClean {
+		if err := p.swapLogLocked(tail); err != nil {
 			return Meta{}, nil, nil, fmt.Errorf("repair %s: %w", p.logF, err)
 		}
 	}
-	return meta, snap, log, nil
+	return meta, snap, tail, nil
 }
 
-func splitLines(b []byte) [][]byte {
-	var out [][]byte
-	start := 0
-	for i, c := range b {
-		if c == '\n' {
-			out = append(out, b[start:i])
-			start = i + 1
+// loadMeta reads meta.json. A file that exists but cannot be parsed is an
+// error, not an empty state: silently resetting the term and vote would let this
+// node vote twice in a term it has already voted in.
+func (p *filePersister) loadMeta() (Meta, error) {
+	var meta Meta
+	b, err := os.ReadFile(p.metaF)
+	if os.IsNotExist(err) {
+		return meta, nil
+	}
+	if err != nil {
+		return meta, err
+	}
+	if err := json.Unmarshal(b, &meta); err != nil {
+		return meta, fmt.Errorf("corrupt %s: %w", p.metaF, err)
+	}
+	return meta, nil
+}
+
+// loadSnapshot reads snapshot.bin. Its header index wins over meta.json when
+// newer (a crash after the snapshot was written but before meta.json was).
+func (p *filePersister) loadSnapshot(meta *Meta) ([]byte, error) {
+	b, err := os.ReadFile(p.snapF)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	index, term, payload, ok := decodeSnapshot(b)
+	switch {
+	case !ok: // legacy headerless file: trust meta.json
+	case index > meta.SnapshotIndex:
+		meta.SnapshotIndex, meta.SnapshotTerm = index, term
+	case index < meta.SnapshotIndex:
+		return nil, fmt.Errorf("%s (index %d) is older than meta.json (index %d)", p.snapF, index, meta.SnapshotIndex)
+	}
+	return payload, nil
+}
+
+// readLogFile parses log.jsonl, skipping unreadable lines. It also reports how
+// many non-blank lines there were and whether the file ends with a newline, so
+// Load can tell whether the file needs repair.
+func (p *filePersister) readLogFile() (entries []*raftpb.LogEntry, lines int, endsClean bool, err error) {
+	b, err := os.ReadFile(p.logF)
+	if os.IsNotExist(err) {
+		return nil, 0, true, nil
+	}
+	if err != nil {
+		return nil, 0, false, err
+	}
+	for _, line := range bytes.Split(b, []byte{'\n'}) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		lines++
+		var e raftpb.LogEntry
+		if json.Unmarshal(line, &e) == nil {
+			entries = append(entries, &e)
 		}
 	}
-	if start < len(b) {
-		out = append(out, b[start:])
+	return entries, lines, len(b) == 0 || b[len(b)-1] == '\n', nil
+}
+
+// contiguousTail keeps the entries that continue the snapshot: starting at
+// snapshotIndex+1 and increasing by one. The in-memory offset arithmetic depends
+// on that. Duplicates are dropped and the first gap ends the tail; anything lost
+// that way is refetched from the leader.
+func contiguousTail(raw []*raftpb.LogEntry, snapshotIndex uint64) []*raftpb.LogEntry {
+	var tail []*raftpb.LogEntry
+	expect := snapshotIndex + 1
+	for _, e := range raw {
+		if e.Index < expect {
+			continue // duplicate, or already covered by the snapshot
+		}
+		if e.Index > expect {
+			break // gap: the rest of the file is unreliable
+		}
+		tail = append(tail, e)
+		expect++
 	}
-	return out
-}
-
-// memPersister is an in-memory Persister for tests and restart simulation.
-type memPersister struct {
-	mu   sync.Mutex
-	meta Meta
-	snap []byte
-	log  []*raftpb.LogEntry
-}
-
-func (p *memPersister) AppendLog(entries []*raftpb.LogEntry) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.log = append(p.log, entries...)
-	return nil
-}
-
-func (p *memPersister) SaveMeta(meta Meta) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.meta = meta
-	return nil
-}
-
-func (p *memPersister) Rewrite(meta Meta, snapshot []byte, log []*raftpb.LogEntry) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.meta = meta
-	if snapshot != nil {
-		p.snap = append([]byte(nil), snapshot...)
-	}
-	p.log = append([]*raftpb.LogEntry(nil), log...)
-	return nil
-}
-
-func (p *memPersister) Load() (Meta, []byte, []*raftpb.LogEntry, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.meta, p.snap, append([]*raftpb.LogEntry(nil), p.log...), nil
+	return tail
 }

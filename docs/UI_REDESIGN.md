@@ -97,7 +97,8 @@ The control server previously listened on all interfaces with `Access-Control-Al
 and started or killed processes on a plain GET. Any web page the user visited could have
 driven it (including `/stop`, which kills every `raftnode`). Now it listens on `127.0.0.1`,
 sends no CORS headers, and every mutating endpoint requires POST. The node HTTP gateway
-(`/set`, `/del` over GET with open CORS) is unchanged and still on the to-do list.
+(`/set`, `/del` over GET with open CORS) was fixed later: writes need POST and browser
+requests must come from a local page (see `RELIABILITY.md`).
 
 ## A bug the new UI exposed
 

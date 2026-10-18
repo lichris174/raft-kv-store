@@ -29,9 +29,8 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// Client-facing key-value API. Feature 1 implements this against a single node
-// with an in-memory store (no Raft yet). Internal node-to-node RPCs
-// (RequestVote, AppendEntries, InstallSnapshot) are added in later features.
+// Client-facing key-value API. Writes go through the Raft leader; a node that
+// cannot serve a request returns the leader's address in leader_hint.
 type KVClient interface {
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetReply, error)
 	Set(ctx context.Context, in *SetRequest, opts ...grpc.CallOption) (*WriteReply, error)
@@ -91,9 +90,8 @@ func (c *kVClient) Status(ctx context.Context, in *StatusRequest, opts ...grpc.C
 // All implementations must embed UnimplementedKVServer
 // for forward compatibility.
 //
-// Client-facing key-value API. Feature 1 implements this against a single node
-// with an in-memory store (no Raft yet). Internal node-to-node RPCs
-// (RequestVote, AppendEntries, InstallSnapshot) are added in later features.
+// Client-facing key-value API. Writes go through the Raft leader; a node that
+// cannot serve a request returns the leader's address in leader_hint.
 type KVServer interface {
 	Get(context.Context, *GetRequest) (*GetReply, error)
 	Set(context.Context, *SetRequest) (*WriteReply, error)

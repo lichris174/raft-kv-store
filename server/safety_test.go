@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"errors"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,48 +17,30 @@ import (
 // failingPersister wraps memPersister and fails selected operations on demand.
 type failingPersister struct {
 	memPersister
-	mu2         sync.Mutex
-	failAppend  bool
-	failMeta    bool
-	failRewrite bool
+	failAppend, failMeta, failRewrite atomic.Bool
 }
 
 var errDisk = errors.New("injected disk failure")
 
-func (p *failingPersister) set(fn func()) {
-	p.mu2.Lock()
-	defer p.mu2.Unlock()
-	fn()
-}
-
 func (p *failingPersister) AppendLog(entries []*raftpb.LogEntry) error {
-	p.mu2.Lock()
-	fail := p.failAppend
-	p.mu2.Unlock()
-	if fail {
+	if p.failAppend.Load() {
 		return errDisk
 	}
 	return p.memPersister.AppendLog(entries)
 }
 
 func (p *failingPersister) SaveMeta(meta Meta) error {
-	p.mu2.Lock()
-	fail := p.failMeta
-	p.mu2.Unlock()
-	if fail {
+	if p.failMeta.Load() {
 		return errDisk
 	}
 	return p.memPersister.SaveMeta(meta)
 }
 
-func (p *failingPersister) Rewrite(meta Meta, snap []byte, log []*raftpb.LogEntry) error {
-	p.mu2.Lock()
-	fail := p.failRewrite
-	p.mu2.Unlock()
-	if fail {
+func (p *failingPersister) Rewrite(meta Meta, snap []byte, tail []*raftpb.LogEntry) error {
+	if p.failRewrite.Load() {
 		return errDisk
 	}
-	return p.memPersister.Rewrite(meta, snap, log)
+	return p.memPersister.Rewrite(meta, snap, tail)
 }
 
 // soloNode builds a 3-member-config Raft node that is never Run, so only the
@@ -71,7 +53,7 @@ func soloNode(p Persister, fatal func(op string, err error)) (*Raft, *KVStore) {
 	cfg.Restore = store.Restore
 	cfg.Persister = p
 	cfg.OnPersistFatal = fatal
-	return NewRaft(cfg, newInmemNet()), store
+	return NewRaft(cfg, newInmemNet().endpoint("n0")), store
 }
 
 func setEntry(term, index uint64, key, val string) *raftpb.LogEntry {
@@ -190,7 +172,7 @@ func TestInstallSnapshot_TermMismatchDropsLogTail(t *testing.T) {
 func TestAppendEntries_PersistFailureRejectsAndRollsBack(t *testing.T) {
 	p := &failingPersister{}
 	r, _ := soloNode(p, nil)
-	p.set(func() { p.failAppend = true })
+	p.failAppend.Store(true)
 
 	_, err := r.AppendEntries(context.Background(), &raftpb.AppendEntriesArgs{
 		Term: 1, LeaderId: "L", Entries: []*raftpb.LogEntry{setEntry(1, 1, "a", "1")},
@@ -203,7 +185,7 @@ func TestAppendEntries_PersistFailureRejectsAndRollsBack(t *testing.T) {
 	}
 
 	// Once the disk recovers, the same entry is accepted.
-	p.set(func() { p.failAppend = false })
+	p.failAppend.Store(false)
 	mustAppend(t, r, &raftpb.AppendEntriesArgs{
 		Term: 1, LeaderId: "L", Entries: []*raftpb.LogEntry{setEntry(1, 1, "a", "1")},
 	})
@@ -217,7 +199,7 @@ func TestRequestVote_PersistFailureDoesNotGrantVote(t *testing.T) {
 	r.mu.Lock()
 	r.currentTerm = 3
 	r.mu.Unlock()
-	p.set(func() { p.failMeta = true })
+	p.failMeta.Store(true)
 
 	reply, err := r.RequestVote(context.Background(), &raftpb.RequestVoteArgs{Term: 3, CandidateId: "n1"})
 	if err == nil && reply.VoteGranted {
@@ -238,7 +220,7 @@ func TestPropose_PersistFailureRollsBack(t *testing.T) {
 	r.state = Leader
 	r.currentTerm = 1
 	r.mu.Unlock()
-	p.set(func() { p.failAppend = true })
+	p.failAppend.Store(true)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -254,25 +236,55 @@ func TestPropose_PersistFailureRollsBack(t *testing.T) {
 	}
 }
 
-// A conflict truncation cannot be rolled back in memory, so if its rewrite fails
-// the node must crash-stop instead of acknowledging.
-func TestAppendEntries_TruncationRewriteFailureIsFatal(t *testing.T) {
+// A conflict truncation is persisted before memory changes, so a failed rewrite
+// rejects the RPC and leaves the log exactly as it was (no crash needed).
+func TestAppendEntries_TruncationRewriteFailureLeavesLogIntact(t *testing.T) {
 	p := &failingPersister{}
-	var gotOp string
-	r, _ := soloNode(p, func(op string, err error) { gotOp = op })
+	r, _ := soloNode(p, func(op string, err error) { t.Fatalf("unexpected fatal %s: %v", op, err) })
 	mustAppend(t, r, &raftpb.AppendEntriesArgs{
 		Term: 1, LeaderId: "old",
 		Entries: []*raftpb.LogEntry{setEntry(1, 1, "a", "1"), setEntry(1, 2, "b", "old")},
 	})
-	p.set(func() { p.failRewrite = true })
+	p.failRewrite.Store(true)
 
 	// New leader overwrites index 2 with a different term: conflict -> truncate.
-	r.AppendEntries(context.Background(), &raftpb.AppendEntriesArgs{
+	reply, err := r.AppendEntries(context.Background(), &raftpb.AppendEntriesArgs{
 		Term: 2, LeaderId: "new", PrevLogIndex: 1, PrevLogTerm: 1,
 		Entries: []*raftpb.LogEntry{setEntry(2, 2, "b", "new")},
 	})
-	if gotOp == "" {
-		t.Fatal("failed truncation rewrite was not treated as fatal")
+	if err == nil || reply.GetSuccess() {
+		t.Fatalf("failed rewrite was acknowledged: err=%v reply=%v", err, reply)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e := r.entryAtLocked(2); e == nil || e.Term != 1 || e.Value != "old" {
+		t.Fatalf("log changed despite failed rewrite: entry 2 = %v", e)
+	}
+}
+
+// A snapshot that cannot be persisted must be rejected without touching the
+// state machine or the log; the leader re-sends it later.
+func TestInstallSnapshot_PersistFailureLeavesStateIntact(t *testing.T) {
+	p := &failingPersister{}
+	r, store := soloNode(p, func(op string, err error) { t.Fatalf("unexpected fatal %s: %v", op, err) })
+	mustAppend(t, r, &raftpb.AppendEntriesArgs{
+		Term: 1, LeaderId: "L", LeaderCommit: 1,
+		Entries: []*raftpb.LogEntry{setEntry(1, 1, "a", "1")},
+	})
+	p.failRewrite.Store(true)
+
+	_, err := r.InstallSnapshot(context.Background(), &raftpb.InstallSnapshotArgs{
+		Term: 1, LeaderId: "L", LastIncludedIndex: 5, LastIncludedTerm: 1,
+		Data: []byte(`{"z":"9"}`),
+	})
+	if err == nil {
+		t.Fatal("unpersisted snapshot was acknowledged")
+	}
+	if s := r.StatusSnapshot(); s.SnapshotIndex != 0 || s.LastApplied != 1 || s.LogLen != 1 {
+		t.Fatalf("state changed: %+v", s)
+	}
+	if v, _ := store.Get("a"); v != "1" {
+		t.Fatalf("state machine was restored from the rejected snapshot (a=%q)", v)
 	}
 }
 
@@ -331,13 +343,9 @@ func TestRequestVote_GrantedAfterLeaderGoesSilent(t *testing.T) {
 
 // A leader that is in contact with a majority also ignores higher-term requests.
 func TestRequestVote_LeaderWithQuorumIgnoresDisruptor(t *testing.T) {
-	net := newInmemNet()
-	nodes, _ := buildCluster(net, 3)
-	for _, r := range nodes {
-		go r.Run()
-		defer r.Stop()
-	}
-	leader := waitForLeader(t, nodes, nil, 2*time.Second)
+	c := newCluster(t, 3, 0)
+	l := c.waitLeader()
+	leader := c.node(l)
 	term := leader.StatusSnapshot().Term
 	time.Sleep(60 * time.Millisecond) // let heartbeats establish contact
 
@@ -352,23 +360,10 @@ func TestRequestVote_LeaderWithQuorumIgnoresDisruptor(t *testing.T) {
 // Check-quorum: a leader that cannot reach a majority must stop calling itself
 // leader, otherwise it shows as one forever and clients keep writing to it.
 func TestLeader_StepsDownWhenIsolated(t *testing.T) {
-	net := newInmemNet()
-	nodes, _ := buildCluster(net, 3)
-	for _, r := range nodes {
-		go r.Run()
-		defer r.Stop()
-	}
-	leader := waitForLeader(t, nodes, nil, 2*time.Second)
-	// inmemNet only blocks traffic *to* a node, so cut every node, the leader
-	// included, to get a real two-way partition around it.
-	for _, r := range nodes {
-		net.setDown(r.cfg.Addr, true)
-	}
-	deadline := time.Now().Add(1 * time.Second)
-	for time.Now().Before(deadline) && leader.IsLeader() {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if leader.IsLeader() {
+	c := newCluster(t, 3, 0)
+	l := c.waitLeader()
+	c.net.partition([]string{c.addrs[l]})
+	if !eventually(time.Second, func() bool { return !c.node(l).IsLeader() }) {
 		t.Fatal("isolated leader never stepped down")
 	}
 }

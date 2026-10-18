@@ -264,20 +264,22 @@ pwsh scripts/chaos.ps1 -Rounds 8 -KillLeader               # leader-failure faul
 
 ## Not done yet
 
-Found in the audit, deliberately left for later rounds:
+Found in the audit and left for later rounds. Status as of the reliability round
+([`RELIABILITY.md`](RELIABILITY.md)):
 
-- **Read-index is incomplete.** No check that the leader has committed an entry in
-  its own term, and no wait for `lastApplied >= readIndex`, so a read right after an
-  election can be stale.
-- **Snapshot transfer** uses the 120 ms RPC timeout and is re-sent every heartbeat,
-  so a large snapshot can never finish. Needs chunking or a longer timeout.
-- **Replication** re-sends the whole tail on every proposal with no in-flight limit
-  or batch cap; compaction and snapshotting run under the Raft mutex and stall RPCs.
-- **No pre-vote.** Stickiness and check-quorum (step 4) cover the observed cases; pre-vote
-  would need a protobuf change.
-- **The race detector does not run** here: MinGW's `gcc` is 32-bit. A 64-bit
-  toolchain would let `go test -race` cover the lock-heavy code.
-- **Security:** the node HTTP gateway still mutates over GET with open CORS and binds to all
-  interfaces. (The control server was fixed in the UI redesign.)
-- **Docs and polish:** `SPEC.md` does not contain the rules and bug history the
-  README points to; CI; license. (Dashboard kill/restart buttons shipped in the UI redesign.)
+- ~~**Read-index is incomplete.**~~ Done: the leader waits for a current-term commit,
+  confirms with a heartbeat quorum, then waits for `lastApplied >= readIndex`.
+- ~~**Snapshot transfer** uses the 120 ms RPC timeout and is re-sent every heartbeat.~~
+  Done: 2 s snapshot timeout, at most one request in flight per peer. (Still sent whole,
+  not chunked.)
+- ~~**Replication** re-sends the whole tail on every proposal with no in-flight limit
+  or batch cap.~~ Done: one request in flight per peer, 512 entries per message,
+  one-step backtracking via a `last_index` hint. Compaction still runs under the Raft
+  mutex; after a failed write it now backs off instead of retrying on every apply.
+- ~~**No pre-vote.**~~ Done (`pre_vote` in `RequestVoteArgs`).
+- **The race detector does not run** here: MinGW's `gcc` is 32-bit. Still open.
+- ~~**Security:** the node HTTP gateway still mutates over GET with open CORS.~~ Done:
+  writes need POST and browser requests must come from a local page. It still binds to
+  all interfaces (Docker needs that).
+- **Docs and polish:** CI and a license are still open. The README no longer points at
+  `SPEC.md` for things it does not contain.

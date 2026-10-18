@@ -26,11 +26,11 @@ let renderQueued = false;
 
 // ---------------------------------------------------------------- polling
 
-async function fetchJSON(url, ms) {
+async function fetchJSON(url, ms, method = "GET") {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ms);
   try {
-    const r = await fetch(url, { signal: ctrl.signal });
+    const r = await fetch(url, { method, signal: ctrl.signal });
     if (!r.ok) throw new Error("HTTP " + r.status);
     return await r.json();
   } finally {
@@ -90,14 +90,13 @@ function observe(n, up, d) {
       addEvent(n.id + " is back and catching up (term " + d.term + ")", "good");
     }
     if (up && prev.up) diffNode(n, prev.d, d);
-  } else if (up && !prev.seen && nodes.every((x) => !x.seen || x === n)) {
+  } else if (up && nodes.every((x) => !x.seen || x === n)) {
     addEvent("Connected to the cluster");
   }
   scheduleRender();
 }
 
 function diffNode(n, a, b) {
-  if (!a) return;
   if (a.role !== "leader" && b.role === "leader") {
     addEvent(n.id + " became leader for term " + b.term, "good");
   } else if (a.role !== "candidate" && b.role === "candidate") {
@@ -121,8 +120,7 @@ function clusterView() {
 }
 
 function leaderURL() {
-  const v = clusterView();
-  return v.leader ? v.leader.url : null;
+  return clusterView().leader?.url ?? null;
 }
 
 function nodeByGRPC(addr) {
@@ -162,7 +160,7 @@ function renderBanner() {
     cls = !control && everSeen ? "bad" : "";
     if (control) {
       title = "No cluster running";
-      detail = "Press Start cluster to launch 5 nodes.";
+      detail = "Press Start cluster to launch " + nodes.length + " nodes.";
     } else if (everSeen) {
       title = "No nodes are responding";
       detail = "Every node is down or unreachable from this page.";
@@ -312,7 +310,9 @@ function renderReadSelect() {
 
 // ---------------------------------------------------------------- control actions
 
-async function post(path) {
+// postAction POSTs to the control server and resolves to null on success or an
+// error message. tests.js uses it too.
+async function postAction(path) {
   try {
     const r = await fetch(path, { method: "POST" });
     const j = await r.json().catch(() => ({}));
@@ -326,7 +326,7 @@ async function post(path) {
 async function nodeAction(n) {
   const action = n.ui.btn.dataset.action;
   n.ui.btn.disabled = true;
-  const err = await post("/node/" + action + "?id=" + encodeURIComponent(n.id));
+  const err = await postAction("/node/" + action + "?id=" + encodeURIComponent(n.id));
   if (err) addEvent("Could not " + action + " " + n.id + ": " + err, "bad");
   else if (action === "kill") addEvent("You killed " + n.id);
   else addEvent("You started " + n.id);
@@ -336,14 +336,14 @@ async function nodeAction(n) {
 $("btn-start-all").addEventListener("click", async () => {
   const fresh = $("fresh").checked ? "1" : "0";
   $("btn-start-all").disabled = true;
-  const err = await post("/cluster/start?fresh=" + fresh);
+  const err = await postAction("/cluster/start?fresh=" + fresh);
   if (err) addEvent("Could not start the cluster: " + err, "bad");
-  else addEvent("Starting 5 nodes");
+  else addEvent("Starting " + nodes.length + " nodes");
 });
 
 $("btn-stop-all").addEventListener("click", async () => {
   $("btn-stop-all").disabled = true;
-  const err = await post("/cluster/stop");
+  const err = await postAction("/cluster/stop");
   if (err) addEvent("Could not stop the cluster: " + err, "bad");
   else addEvent("You stopped every node");
 });
@@ -356,15 +356,24 @@ function say(kind, text) {
   el.textContent = text;
 }
 
-// writeKey sends one write to the leader, following a redirect if the node it
+// requireKey returns the trimmed key, or null after telling the user to enter one.
+function requireKey() {
+  const key = $("kv-key").value.trim();
+  if (!key) say("err", "Enter a key first.");
+  return key || null;
+}
+
+const setPath = (key, value) => "/set?key=" + encodeURIComponent(key) + "&value=" + encodeURIComponent(value);
+
+// writeKey POSTs one write to the leader, following a redirect if the node it
 // reached is not the leader any more. Resolves to null or an error string.
-async function writeKey(path, depth = 0) {
+async function writeKey(path) {
   let url = leaderURL();
   if (!url) return "There is no leader right now, so the write cannot be accepted.";
-  for (let hop = depth; hop < 4; hop++) {
+  for (let hop = 0; hop < 4; hop++) {
     let j;
     try {
-      j = await fetchJSON(url + path, 3000);
+      j = await fetchJSON(url + path, 3000, "POST");
     } catch {
       return "The leader did not answer in time.";
     }
@@ -377,26 +386,26 @@ async function writeKey(path, depth = 0) {
 }
 
 async function doSet() {
-  const key = $("kv-key").value.trim(), value = $("kv-value").value;
-  if (!key) return say("err", "Enter a key first.");
+  const key = requireKey(), value = $("kv-value").value;
+  if (!key) return;
   const t0 = performance.now();
-  const err = await writeKey("/set?key=" + encodeURIComponent(key) + "&value=" + encodeURIComponent(value));
+  const err = await writeKey(setPath(key, value));
   if (err) return say("err", err);
   say("ok", "Saved " + key + " = " + value + " (" + Math.round(performance.now() - t0) + " ms). A majority of nodes has it.");
 }
 
 async function doDelete() {
-  const key = $("kv-key").value.trim();
-  if (!key) return say("err", "Enter a key first.");
+  const key = requireKey();
+  if (!key) return;
   const err = await writeKey("/del?key=" + encodeURIComponent(key));
   say(err ? "err" : "ok", err || "Deleted " + key + ".");
 }
 
 async function doGet() {
-  const key = $("kv-key").value.trim();
-  if (!key) return say("err", "Enter a key first.");
+  const key = requireKey();
+  if (!key) return;
   const pick = $("read-from").value;
-  let target = pick === "auto" ? nodes.find((n) => n.url === leaderURL()) : nodes[Number(pick)];
+  let target = pick === "auto" ? clusterView().leader : nodes[Number(pick)];
   if (!target) return say("err", "There is no leader to read from.");
   if (!target.up) return say("err", target.id + " is not responding.");
   try {
@@ -421,7 +430,7 @@ async function doBurst() {
     const jobs = [];
     for (let i = 0; i < 10; i++) {
       const k = "demo-" + Math.floor(Math.random() * 1e6);
-      jobs.push(writeKey("/set?key=" + k + "&value=" + batch + "-" + i));
+      jobs.push(writeKey(setPath(k, batch + "-" + i)));
     }
     failed += (await Promise.all(jobs)).filter(Boolean).length;
   }

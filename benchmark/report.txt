@@ -1,0 +1,14 @@
+﻿cluster: [localhost:9001 localhost:9002 localhost:9003 localhost:9004 localhost:9005]
+writers=24 readers=16 duration=5s keyspace=20000
+
+leader: localhost:9001
+
+========================================================
+WRITE   ops=58116     11623 ops/s  errors=0
+        latency  p50=1.27ms  p95=3.80ms  p99=23.42ms  max=51.09ms
+
+READ    ops=161180    32236 ops/s  errors=0
+        latency  p50=0.56ms  p95=1.10ms  p99=1.69ms  max=24.72ms
+
+
+generated: 2026-10-28T12:01:56.7576761-04:00  nodes=5 writers=24 readers=16 duration=5s fsync=False
